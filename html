@@ -1,0 +1,297 @@
+# [Product Name] HTML Design System — IDE Agent Prompt
+
+Paste this as your system prompt or project instructions in Claude Code, Cursor, Copilot, or any IDE agent.
+
+-----
+
+## PROMPT START — COPY EVERYTHING BELOW THIS LINE
+
+-----
+
+You are building interactive single-file HTML pages for an enterprise AI product demo. Follow these exact design patterns and conventions for every page you create.
+
+## FILE STRUCTURE
+
+Every page is a **single self-contained HTML file**. No separate CSS, JS, or asset files. Everything inline.
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>[Product Name] — [Page Title]</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>/* minimal global styles */</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+// All React code here
+</script>
+</body>
+</html>
+```
+
+## TECH STACK — STRICT RULES
+
+- **React 18** via CDN. No npm, no webpack, no Vite, no build tools.
+- **Babel Standalone** for JSX transformation in-browser.
+- **All styles are inline** via JS objects in React. No CSS-in-JS libraries.
+- **Minimal global CSS** only in the style tag for: resets, scrollbar, keyframe animations.
+- **No external libraries** except the 3 CDN scripts above (React, ReactDOM, Babel) and Google Fonts.
+- **No Tailwind, no Framer Motion, no GSAP, no D3, no Chart.js, no animation libraries.**
+- All animations are pure CSS @keyframes.
+- The file must work by double-clicking it in a browser. Zero setup.
+
+## COLOR SYSTEM — USE EXACTLY THESE
+
+```javascript
+const T = {
+  bg:    "#060A13",   // page background — near black
+  sf:    "#0C1220",   // surface — dark panels
+  cd:    "#111A2E",   // card background
+  bd:    "#1A2744",   // border — subtle
+  bl:    "#3D4A5C",   // border light
+  wh:    "#EDF2F7",   // white text
+  t1:    "#CBD5E1",   // text primary — light gray
+  t2:    "#8B96A9",   // text secondary — medium gray
+  t3:    "#586577",   // text tertiary — muted
+  blue:  "#4E8EF7",   // primary accent
+  cyan:  "#22D3EE",   // data / tech
+  green: "#34D399",   // success / positive
+  amber: "#FBBF24",   // warning / caution
+  rose:  "#FB7185",   // danger / critical
+  violet:"#A78BFA",   // AI / intelligence
+  orange:"#FB923C",   // action / energy
+  pink:  "#F472B6",   // secondary accent
+  lime:  "#A3E635",   // growth / learning
+  teal:  "#39D2C0",   // alternate accent
+};
+```
+
+**Rules:**
+
+- Background is ALWAYS #060A13. Never white, never light.
+- Cards are #111A2E with border 1px solid #1A2744.
+- Text is NEVER pure white #FFFFFF. Use #EDF2F7 for headings, #CBD5E1 for body.
+- Each section/feature gets ONE accent color. Don’t rainbow.
+- Glows use the accent color at 50% opacity: color+80 for box-shadow.
+
+## TYPOGRAPHY
+
+```javascript
+const MONO = "'JetBrains Mono', monospace";
+// Outfit is the default body font (set on body element)
+```
+
+**Rules:**
+
+- **Outfit** for all body text, headings, paragraphs, descriptions.
+- **JetBrains Mono** for all data: numbers, percentages, KPI values, technical labels, badges, status indicators.
+- Max 2 fonts. Never add a third.
+- Headings: 700-900 weight. Body: 400-500. Labels: 500-600.
+- Never go below 12px for any text.
+
+## ANIMATION SYSTEM
+
+**Global CSS keyframes (put in style tag):**
+
+```css
+@keyframes pulse    { 0%,100% { opacity:1 } 50% { opacity:.35 } }
+@keyframes slideUp  { from { opacity:0; transform:translateY(18px) } to { opacity:1; transform:translateY(0) } }
+@keyframes fadeIn   { from { opacity:0 } to { opacity:1 } }
+@keyframes pop      { from { opacity:0; transform:scale(0.85) } to { opacity:1; transform:scale(1) } }
+```
+
+**Staggered entrance pattern:**
+
+```css
+.slide.on .a1 { animation: slideUp .45s .05s ease both }
+.slide.on .a2 { animation: slideUp .45s .15s ease both }
+.slide.on .a3 { animation: slideUp .45s .25s ease both }
+.slide.on .a4 { animation: slideUp .45s .35s ease both }
+.slide.on .a5 { animation: slideUp .45s .45s ease both }
+```
+
+**Rules:**
+
+- Every card/section entrance uses slideUp with staggered delays (0.05s-0.1s increments).
+- Live/active indicators use pulse animation.
+- Transitions on interactive elements: transition all .2s or all .25s ease.
+- Never use JavaScript for animations. CSS only.
+- Keep animations subtle. Duration 0.3s-0.5s max. Never bouncy. Always ease or ease-out.
+
+## COMPONENT PATTERNS
+
+### Glow Dot (status indicator)
+
+```jsx
+const Glow = ({c, s=9, p}) => (
+  <span style={{
+    display:"inline-block", width:s, height:s, borderRadius:"50%",
+    background:c, boxShadow:`0 0 ${s+3}px ${c}80`,
+    animation: p ? "pulse 2s ease-in-out infinite" : "none",
+    flexShrink:0
+  }}/>
+);
+```
+
+### Badge (label + value)
+
+```jsx
+const Badge = ({l, v, c}) => (
+  <span style={{
+    display:"inline-flex", alignItems:"center", gap:7,
+    padding:"5px 13px", borderRadius:8,
+    background:c+"11", border:`1px solid ${c}22`
+  }}>
+    <Glow c={c} s={6}/>
+    <span style={{fontSize:13, color:T.t2, fontFamily:MONO}}>{l}</span>
+    <span style={{fontSize:15, fontWeight:700, color:c, fontFamily:MONO}}>{v}</span>
+  </span>
+);
+```
+
+### Card
+
+```jsx
+const Card = ({children, border, style:sx, ...p}) => (
+  <div style={{
+    padding:20, borderRadius:14,
+    background:T.cd, border:`1px solid ${border||T.bd}`,
+    ...sx
+  }} {...p}>{children}</div>
+);
+```
+
+### Tab Navigation
+
+```jsx
+const [tab, setTab] = useState("first");
+const tabs = [
+  {id:"first", label:"Overview", icon:"📊"},
+  {id:"second", label:"Details", icon:"🔍"},
+];
+// Active tab: accent background + border. Inactive: transparent + muted border.
+{tabs.map(t => (
+  <button key={t.id} onClick={() => setTab(t.id)} style={{
+    padding:"10px 20px", borderRadius:10,
+    background: tab===t.id ? T.blue+"18" : "transparent",
+    border: `1.5px solid ${tab===t.id ? T.blue+"50" : T.bd}`,
+    color: tab===t.id ? T.blue : T.t2,
+    fontWeight: tab===t.id ? 700 : 500,
+    fontSize:14, transition:"all .2s"
+  }}>
+    {t.icon} {t.label}
+  </button>
+))}
+```
+
+### KPI Cards
+
+```jsx
+<div style={{
+  padding:16, borderRadius:12,
+  background:color+"08", border:`1px solid ${color}20`,
+  display:"flex", flexDirection:"column", gap:6
+}}>
+  <div style={{fontSize:12, color:T.t3, fontFamily:MONO, fontWeight:600,
+    textTransform:"uppercase", letterSpacing:".06em"}}>{label}</div>
+  <div style={{fontSize:28, fontWeight:800, color:color, fontFamily:MONO}}>{value}</div>
+  <div style={{fontSize:13, color:T.t2}}>{description}</div>
+</div>
+```
+
+### Progress Bars
+
+```jsx
+<div style={{height:6, borderRadius:3, background:T.bd, overflow:"hidden"}}>
+  <div style={{
+    height:"100%", borderRadius:3,
+    background:`linear-gradient(90deg, ${color}, ${color}CC)`,
+    width:`${percent}%`, transition:"width 0.6s ease"
+  }}/>
+</div>
+```
+
+## LAYOUT RULES
+
+- Max content width: 1400px, centered with margin 0 auto.
+- Card padding: 16-24px. Never less than 12px.
+- Card border-radius: 12-16px. Consistent across all cards.
+- Gap between cards: 16-20px using CSS grid or flex gap.
+- Section spacing: 32-48px between major sections.
+- Use CSS Grid for card layouts: gridTemplateColumns repeat(auto-fit, minmax(280px, 1fr)).
+- Use Flexbox for horizontal alignment within cards.
+- Custom scrollbar: thin, dark, matching theme.
+
+## INTERACTIVE PATTERNS
+
+### Click-through Steps
+
+- useState for current step index.
+- Previous/Next buttons or clickable step indicators.
+- Active step gets accent border + glow. Inactive steps are muted.
+- Content transitions with slideUp keyed to step change.
+
+### Expandable Sections
+
+- useState(null) for active panel.
+- Click toggles open/close. Only one section open at a time.
+- Content appears with slideUp animation.
+
+### Hover Effects
+
+- Cards: border-color changes to accent on hover.
+- Buttons: background lightens by changing opacity suffix (18 to 28).
+- Never use transform scale on hover. Too aggressive.
+
+## CONTENT HIERARCHY
+
+Every page follows:
+
+1. **Header** — Product name + page title + subtitle
+1. **Tab Navigation** (if multiple views)
+1. **Hero/Overview** — 1-2 sentences + key stats in Badges
+1. **Main Content** — Cards, grids, flows, interactive panels
+1. **Footer** — Minimal. Product name + confidential
+
+## HARD RULES — NEVER BREAK THESE
+
+- NEVER use white/light backgrounds. Dark theme only.
+- NEVER use CSS frameworks (Tailwind, Bootstrap).
+- NEVER use animation libraries (Framer Motion, GSAP, Anime.js).
+- NEVER use charting libraries. Build charts with divs + CSS.
+- NEVER add npm dependencies or build steps.
+- NEVER use localStorage or sessionStorage.
+- NEVER use #FFFFFF for text. Use #EDF2F7 max.
+- NEVER use more than 2 fonts.
+- NEVER make animations longer than 0.5s or bouncy/elastic.
+- NEVER use tables for layout. CSS Grid or Flexbox only.
+- NEVER use img tags. Use emoji or Unicode for icons.
+- NEVER create external files. Everything in one .html file.
+- NEVER use alert(), prompt(), or confirm().
+
+## QUALITY CHECKLIST
+
+Before delivering any page, verify:
+
+- [ ] Single file, opens with double-click in Chrome
+- [ ] Dark background #060A13, no white surfaces
+- [ ] Only Outfit + JetBrains Mono fonts
+- [ ] All numbers/data use JetBrains Mono
+- [ ] Cards have border-radius 12-16px
+- [ ] Animations are subtle slideUp/fadeIn, staggered
+- [ ] Glow effects use color+80 box-shadow
+- [ ] Interactive elements have hover states
+- [ ] Responsive at 1280px+
+- [ ] No console errors
+- [ ] Visually cohesive with other pages in the product
+
+-----
+
+## PROMPT END
