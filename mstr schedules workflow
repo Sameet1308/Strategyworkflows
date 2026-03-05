@@ -1,0 +1,657 @@
+#!/usr/bin/env python3
+“””
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Strategy ONE  —  Schedule Manager
+Compatible with: Strategy ONE (September 2025)  v11.5.9
+REST API base: GET/PUT /api/schedules
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SINGLE-FLOW — no multi-step files, no second run needed.
+
+Step 1  Login  →  POST /api/auth/login
+Step 2  Fetch  →  GET  /api/schedules           (paginated)
+Step 3  Scan   →  flag expired=true OR stopDate in the past
+Step 4  Report →  print clear table of problem schedules
+Step 5  Approve→  interactive prompt (A=all / 1,3,5 / Q=quit)
+Step 6  Fix    →  GET /api/schedules/{id}  then  PUT /api/schedules/{id}
+· startDate = today
+· stopDate  = today + 2 years
+Step 7  Summary→  counts + timestamped JSON audit file
+Step 8  Logout →  POST /api/auth/logout
+
+STRATEGY ONE REST API FIELD REFERENCE  (v11.5.9 / Sep 2025)
+─────────────────────────────────────────────────────────────
+GET /api/schedules  →  {“schedules”: […]}
+
+Per schedule object:
+id                   string   32-char GUID
+name                 string
+description          string
+scheduleType         string   “time_based” | “event_based”
+startDate            string   “YYYY-MM-DD”
+stopDate             string   “YYYY-MM-DD”  (absent = no end date)
+scheduleNextDelivery string   ISO-8601 | null when expired
+expired              bool     true when stopDate < today
+time                 object   recurrence block (time_based only)
+└ recurrencePattern  string   “daily”|“weekly”|“monthly”|“yearly”
+└ execution          object   executionPattern, startTime, …
+└ daily/weekly/monthly/yearly  object
+event                object   (event_based only)
+└ id, name
+acg                  int      access control flags
+
+PUT /api/schedules/{id}
+Send the full schedule object back with updated startDate / stopDate.
+The server re-derives `expired` and `scheduleNextDelivery`.
+Do NOT omit the `time` or `event` block — the server needs it.
+
+USAGE
+─────
+pip install requests
+
+# Live server
+
+python strategy_one_schedule_manager.py \
+–host  https://your-server/MicroStrategyLibrary \
+–user  Administrator \
+–pass  yourpassword
+
+# Mock (no server needed)
+
+python strategy_one_schedule_manager.py –mock
+“””
+
+import argparse
+import json
+import sys
+import requests
+from datetime import datetime, timedelta, date
+from typing import Optional
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ─────────────────────────────────────────────────────────
+
+# TUNABLES
+
+# ─────────────────────────────────────────────────────────
+
+EXTEND_YEARS   = 2          # How many years forward to set the new stopDate
+DATE_FMT       = “%Y-%m-%d” # Strategy ONE date format for startDate/stopDate
+AUDIT_FILE_FMT = “schedule_audit_{ts}.json”
+
+# ─────────────────────────────────────────────────────────
+
+# MOCK DATA  — mirrors real Strategy ONE GET /api/schedules response
+
+# (Strategy ONE Sep 2025 field names, real shapes)
+
+# ─────────────────────────────────────────────────────────
+
+MOCK_SCHEDULES = [
+# ── HEALTHY ──────────────────────────────────────────
+{
+“id”: “AAAA0001000000000000000000000001”,
+“name”: “Daily Risk Report”,
+“description”: “Starts 2025-01-01, ends 2027-12-31. Every day at 06:00.”,
+“scheduleType”: “time_based”,
+“startDate”: “2025-01-01”,
+“stopDate”: “2027-12-31”,
+“scheduleNextDelivery”: “2026-03-06T06:00:00+0000”,
+“expired”: False,
+“time”: {
+“recurrencePattern”: “daily”,
+“execution”: {“executionPattern”: “once”, “startTime”: “06:00:00”},
+“daily”: {“dailyPattern”: “day”, “repeatInterval”: 1},
+},
+“acg”: 255,
+},
+{
+“id”: “AAAA0002000000000000000000000002”,
+“name”: “Nightly Data Refresh”,
+“description”: “Starts 2025-01-01, ends 2027-12-31. Every day at 02:00.”,
+“scheduleType”: “time_based”,
+“startDate”: “2025-01-01”,
+“stopDate”: “2027-12-31”,
+“scheduleNextDelivery”: “2026-03-06T02:00:00+0000”,
+“expired”: False,
+“time”: {
+“recurrencePattern”: “daily”,
+“execution”: {“executionPattern”: “once”, “startTime”: “02:00:00”},
+“daily”: {“dailyPattern”: “day”, “repeatInterval”: 1},
+},
+“acg”: 255,
+},
+{
+“id”: “AAAA0003000000000000000000000003”,
+“name”: “Database Load Event”,
+“description”: “Event-based — fires on Database Load event, no end date.”,
+“scheduleType”: “event_based”,
+“startDate”: “2020-01-01”,
+“scheduleNextDelivery”: None,
+“expired”: False,
+“event”: {“id”: “EVT000000000001”, “name”: “Database Load”},
+“acg”: 255,
+},
+# ── EXPIRED / PROBLEM ────────────────────────────────
+{
+“id”: “BBBB0001000000000000000000000001”,
+“name”: “Monthly Premium Summary”,
+“description”: “Starts 2022-03-01, ends 2025-01-01. Monthly on 1st at 07:00.”,
+“scheduleType”: “time_based”,
+“startDate”: “2022-03-01”,
+“stopDate”: “2025-01-01”,        # EXPIRED — past
+“scheduleNextDelivery”: None,
+“expired”: True,
+“time”: {
+“recurrencePattern”: “monthly”,
+“execution”: {“executionPattern”: “once”, “startTime”: “07:00:00”},
+“monthly”: {“monthlyPattern”: “day”, “day”: 1, “repeatInterval”: 1},
+},
+“acg”: 255,
+},
+{
+“id”: “BBBB0002000000000000000000000002”,
+“name”: “Weekly Claims Dashboard”,
+“description”: “Starts 2023-06-01, ends 2025-06-01. Weekly Monday at 08:00.”,
+“scheduleType”: “time_based”,
+“startDate”: “2023-06-01”,
+“stopDate”: “2025-06-01”,        # EXPIRED — past
+“scheduleNextDelivery”: None,
+“expired”: True,
+“time”: {
+“recurrencePattern”: “weekly”,
+“execution”: {“executionPattern”: “once”, “startTime”: “08:00:00”},
+“weekly”: {“repeatInterval”: 1, “daysOfWeek”: [“Monday”]},
+},
+“acg”: 255,
+},
+{
+“id”: “BBBB0003000000000000000000000003”,
+“name”: “Quarterly Underwriting KPIs”,
+“description”: “Starts 2021-01-01, ends 2023-12-31. Every 3 months.”,
+“scheduleType”: “time_based”,
+“startDate”: “2021-01-01”,
+“stopDate”: “2023-12-31”,        # EXPIRED — past
+“scheduleNextDelivery”: None,
+“expired”: True,
+“time”: {
+“recurrencePattern”: “monthly”,
+“execution”: {“executionPattern”: “once”, “startTime”: “09:00:00”},
+“monthly”: {“monthlyPattern”: “day”, “day”: 1, “repeatInterval”: 3},
+},
+“acg”: 255,
+},
+{
+“id”: “BBBB0004000000000000000000000004”,
+“name”: “Bi-Weekly Loss Ratio Report”,
+“description”: “Starts 2023-01-01, ends 2025-12-31. Every 2 weeks Monday.”,
+“scheduleType”: “time_based”,
+“startDate”: “2023-01-01”,
+“stopDate”: “2025-12-31”,        # EXPIRED — past
+“scheduleNextDelivery”: None,
+“expired”: True,
+“time”: {
+“recurrencePattern”: “weekly”,
+“execution”: {“executionPattern”: “once”, “startTime”: “10:00:00”},
+“weekly”: {“repeatInterval”: 2, “daysOfWeek”: [“Monday”]},
+},
+“acg”: 255,
+},
+]
+
+# ─────────────────────────────────────────────────────────
+
+# HELPERS
+
+# ─────────────────────────────────────────────────────────
+
+def W(n: int) -> str:
+return “═” * n
+
+def today_str() -> str:
+return date.today().strftime(DATE_FMT)
+
+def future_str() -> str:
+return (date.today() + timedelta(days=365 * EXTEND_YEARS)).strftime(DATE_FMT)
+
+def parse_date_safe(s: str) -> Optional[date]:
+try:
+return datetime.strptime(s, DATE_FMT).date()
+except Exception:
+return None
+
+def ts_now() -> str:
+return datetime.now().strftime(”%Y%m%d_%H%M%S”)
+
+# ─────────────────────────────────────────────────────────
+
+# STRATEGY ONE REST SESSION
+
+# ─────────────────────────────────────────────────────────
+
+class StrategyOneSession:
+“”“Thin wrapper around requests for Strategy ONE REST API.”””
+
+```
+def __init__(self, base_url: str):
+    self.base_url = base_url.rstrip("/")
+    self._s = requests.Session()
+    self._s.verify = False
+    self._s.headers.update({"Content-Type": "application/json"})
+    self.token: Optional[str] = None
+
+# ── Auth ──────────────────────────────────────────────
+
+def login(self, username: str, password: str):
+    """POST /api/auth/login  →  store X-MSTR-AuthToken header."""
+    resp = self._s.post(
+        f"{self.base_url}/api/auth/login",
+        json={"username": username, "password": password, "loginMode": 1},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    self.token = resp.headers.get("X-MSTR-AuthToken")
+    if not self.token:
+        raise ValueError(
+            "Login did not return X-MSTR-AuthToken. "
+            "Check credentials and loginMode."
+        )
+    self._s.headers["X-MSTR-AuthToken"] = self.token
+    print(f"  ✓  Logged in  →  {self.base_url}")
+
+def logout(self):
+    if self.token:
+        try:
+            self._s.post(f"{self.base_url}/api/auth/logout", timeout=10)
+            print("  ✓  Session closed")
+        except Exception:
+            pass
+
+# ── Schedules ────────────────────────────────────────
+
+def list_schedules(self) -> list[dict]:
+    """GET /api/schedules  (paginated, 200 per page)."""
+    all_items, offset, limit = [], 0, 200
+    while True:
+        r = self._s.get(
+            f"{self.base_url}/api/schedules",
+            params={"offset": offset, "limit": limit},
+            timeout=30,
+        )
+        r.raise_for_status()
+        batch = r.json().get("schedules", [])
+        all_items.extend(batch)
+        if len(batch) < limit:
+            break
+        offset += limit
+    return all_items
+
+def get_schedule(self, schedule_id: str) -> dict:
+    """GET /api/schedules/{id}  →  full object for round-trip PUT."""
+    r = self._s.get(f"{self.base_url}/api/schedules/{schedule_id}", timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def put_schedule(self, schedule_id: str, body: dict) -> bool:
+    """PUT /api/schedules/{id}  →  True on 200/204."""
+    r = self._s.put(
+        f"{self.base_url}/api/schedules/{schedule_id}",
+        json=body,
+        timeout=30,
+    )
+    return r.status_code in (200, 204)
+```
+
+# ─────────────────────────────────────────────────────────
+
+# STEP 2 — CLASSIFY
+
+# ─────────────────────────────────────────────────────────
+
+def classify(schedules: list[dict]) -> tuple[list[dict], list[dict]]:
+“””
+healthy  — expired=false  AND  (no stopDate OR stopDate >= today)
+problem  — expired=true   OR   stopDate < today
+“””
+today   = date.today()
+healthy = []
+problem = []
+
+```
+for s in schedules:
+    reasons = []
+
+    # 1. Server-side expired flag (most reliable)
+    if s.get("expired") is True:
+        reasons.append("expired=true (server flag)")
+
+    # 2. Independent stopDate check (catches stale flags)
+    stop_raw = s.get("stopDate")
+    if stop_raw:
+        stop_dt = parse_date_safe(stop_raw)
+        if stop_dt and stop_dt < today:
+            if not reasons:  # avoid double-labelling
+                reasons.append(f"stopDate {stop_raw} is in the past")
+
+    if reasons:
+        s["_reasons"] = reasons
+        problem.append(s)
+    else:
+        healthy.append(s)
+
+return healthy, problem
+```
+
+# ─────────────────────────────────────────────────────────
+
+# STEP 3 — REPORT
+
+# ─────────────────────────────────────────────────────────
+
+def print_report(healthy: list[dict], problem: list[dict]):
+total = len(healthy) + len(problem)
+now   = datetime.now().strftime(”%Y-%m-%d %H:%M:%S”)
+
+```
+print()
+print(W(74))
+print("  STRATEGY ONE  —  SCHEDULE SCAN REPORT")
+print(f"  {now}")
+print(W(74))
+print(f"  Total schedules : {total}")
+print(f"  ✓  Healthy      : {len(healthy)}")
+print(f"  ✗  Problem      : {len(problem)}")
+print()
+
+if not problem:
+    print("  All schedules healthy — nothing to fix.\n")
+    return
+
+# Table header
+C_NUM  = 4
+C_ID   = 20
+C_NAME = 36
+C_STOP = 14
+C_TYPE = 12
+
+hdr = (
+    f"  {'#':<{C_NUM}} {'ID (truncated)':<{C_ID}} {'Name':<{C_NAME}} "
+    f"{'stopDate':<{C_STOP}} {'Type':<{C_TYPE}} Reason"
+)
+print(hdr)
+print("  " + "─" * (len(hdr) - 2))
+
+for i, s in enumerate(problem, 1):
+    sid   = s.get("id", "")[:C_ID - 1]
+    name  = s.get("name", "")[:C_NAME - 1]
+    stop  = s.get("stopDate", "—")
+    stype = s.get("scheduleType", "")[:C_TYPE - 1]
+    why   = s["_reasons"][0]
+    print(
+        f"  {i:<{C_NUM}} {sid:<{C_ID}} {name:<{C_NAME}} "
+        f"{stop:<{C_STOP}} {stype:<{C_TYPE}} {why}"
+    )
+
+print()
+print(f"  Proposed new dates for all fixes:")
+print(f"    startDate : {today_str()}")
+print(f"    stopDate  : {future_str()}   ({EXTEND_YEARS} years from today)")
+print()
+```
+
+# ─────────────────────────────────────────────────────────
+
+# STEP 4 — APPROVAL PROMPT
+
+# ─────────────────────────────────────────────────────────
+
+def prompt_approval(problem: list[dict]) -> list[dict]:
+“””
+Returns the subset of problem schedules the user approved.
+A        → all
+1,3,5    → specific by row number
+Q        → abort
+“””
+print(“─” * 74)
+print(”  APPROVAL REQUIRED”)
+print(”  Review the list above, then enter:”)
+print(”    A      → approve ALL and fix everything”)
+print(”    1,3,5  → approve specific rows (comma-separated numbers)”)
+print(”    Q      → quit — no changes will be made”)
+print(“─” * 74)
+
+```
+while True:
+    raw = input("  Your choice: ").strip().upper()
+
+    if raw == "Q":
+        print("\n  Aborted — no changes made.\n")
+        sys.exit(0)
+
+    if raw == "A":
+        print(f"\n  ✓  All {len(problem)} schedules approved.\n")
+        return problem
+
+    try:
+        indices  = [int(x.strip()) for x in raw.split(",") if x.strip()]
+        selected = []
+        for idx in indices:
+            if 1 <= idx <= len(problem):
+                selected.append(problem[idx - 1])
+            else:
+                print(f"  ⚠  Row {idx} is out of range — skipped.")
+        if selected:
+            names = ", ".join(s["name"] for s in selected)
+            print(f"\n  ✓  Approved {len(selected)}: {names}\n")
+            return selected
+        print("  No valid rows selected — try again.")
+    except ValueError:
+        print("  Invalid input. Enter A, Q, or numbers like 1,3,5.")
+```
+
+# ─────────────────────────────────────────────────────────
+
+# STEP 5 — FIX
+
+# ─────────────────────────────────────────────────────────
+
+def fix_schedules(
+approved: list[dict],
+session: Optional[StrategyOneSession],
+mock: bool,
+) -> tuple[list[dict], list[dict]]:
+“””
+For each approved schedule:
+• GET full object  (preserves time/event recurrence block)
+• Patch startDate + stopDate
+• PUT it back
+Returns (success_list, failure_list).
+“””
+new_start = today_str()
+new_stop  = future_str()
+
+```
+print(W(74))
+print("  APPLYING FIXES")
+print(W(74))
+print(f"  startDate → {new_start}")
+print(f"  stopDate  → {new_stop}")
+print()
+
+success, failure = [], []
+
+for s in approved:
+    sid  = s["id"]
+    name = s.get("name", sid)
+    print(f"  ▶  {name}")
+    print(f"     ID: {sid}")
+
+    try:
+        if mock:
+            # Simulate full round-trip with mock object
+            full = dict(s)
+        else:
+            # Step A: fetch full object (we need the time/event block)
+            full = session.get_schedule(sid)
+
+        # Step B: apply new dates
+        full["startDate"] = new_start
+        full["stopDate"]  = new_stop
+        # Remove read-only fields the server rejects on PUT
+        for ro in ("expired", "scheduleNextDelivery", "acg"):
+            full.pop(ro, None)
+
+        # Step C: PUT it back
+        ok = True if mock else session.put_schedule(sid, full)
+
+        if ok:
+            print(f"     ✓  Fixed  {s.get('stopDate', '?')} → {new_stop}")
+            success.append({"id": sid, "name": name,
+                            "old_stopDate": s.get("stopDate"),
+                            "new_startDate": new_start,
+                            "new_stopDate": new_stop})
+        else:
+            print(f"     ✗  PUT returned non-200 — check server logs")
+            failure.append({"id": sid, "name": name, "error": "non-200 response"})
+
+    except requests.HTTPError as e:
+        msg = f"HTTP {e.response.status_code}: {e.response.text[:160]}"
+        print(f"     ✗  {msg}")
+        failure.append({"id": sid, "name": name, "error": msg})
+    except Exception as e:
+        print(f"     ✗  {e}")
+        failure.append({"id": sid, "name": name, "error": str(e)})
+
+    print()
+
+return success, failure
+```
+
+# ─────────────────────────────────────────────────────────
+
+# STEP 6 — SUMMARY + AUDIT LOG
+
+# ─────────────────────────────────────────────────────────
+
+def print_summary(success: list, failure: list, skipped: int):
+print(W(74))
+print(”  FIX SUMMARY”)
+print(W(74))
+print(f”  ✓  Fixed       : {len(success)}”)
+print(f”  ✗  Failed      : {len(failure)}”)
+print(f”  ⟳  Skipped     : {skipped}”)
+
+```
+if failure:
+    print("\n  FAILURES:")
+    for f in failure:
+        print(f"    [{f['id'][:16]}…] {f['name']}  —  {f['error']}")
+print()
+```
+
+def write_audit(
+healthy: list, problem: list, approved: list,
+success: list, failure: list,
+):
+path = AUDIT_FILE_FMT.format(ts=ts_now())
+approved_ids = {s[“id”] for s in approved}
+data = {
+“product”     : “Strategy ONE (September 2025)”,
+“run_at”      : datetime.now().isoformat(),
+“summary”     : {
+“total_scanned”: len(healthy) + len(problem),
+“healthy”      : len(healthy),
+“expired”      : len(problem),
+“approved”     : len(approved),
+“fixed”        : len(success),
+“failed”       : len(failure),
+“skipped”      : len(problem) - len(approved),
+},
+“fixed”   : success,
+“failed”  : failure,
+“skipped” : [
+{“id”: s[“id”], “name”: s.get(“name”)}
+for s in problem if s[“id”] not in approved_ids
+],
+}
+with open(path, “w”) as f:
+json.dump(data, f, indent=2)
+print(f”  ✎  Audit log → {path}\n”)
+
+# ─────────────────────────────────────────────────────────
+
+# MAIN
+
+# ─────────────────────────────────────────────────────────
+
+def main():
+ap = argparse.ArgumentParser(
+description=“Strategy ONE Schedule Manager — scan, approve, and fix expired schedules.”
+)
+ap.add_argument(”–host”, help=“Library URL, e.g. https://your-server/MicroStrategyLibrary”)
+ap.add_argument(”–user”, help=“Strategy ONE username”)
+ap.add_argument(”–password”, help=“Strategy ONE password”)
+ap.add_argument(”–mock”, action=“store_true”, help=“Use built-in mock data (no server needed)”)
+args = ap.parse_args()
+
+```
+if not args.mock and not all([args.host, args.user, args.password]):
+    ap.print_help()
+    print("\n  ERROR: --host, --user, --password are required unless using --mock\n")
+    sys.exit(1)
+
+# ── Banner ───────────────────────────────────────────
+print()
+print(W(74))
+print("  STRATEGY ONE  —  SCHEDULE MANAGER")
+print("  Version: September 2025  (11.5.9)")
+mode = "MOCK MODE — no server" if args.mock else args.host
+print(f"  Mode: {mode}")
+print(W(74))
+
+session: Optional[StrategyOneSession] = None
+
+try:
+    # ── Step 1: Login + Fetch ────────────────────────
+    if args.mock:
+        schedules = MOCK_SCHEDULES
+        print(f"\n  Loaded {len(schedules)} mock schedules.\n")
+    else:
+        session = StrategyOneSession(args.host)
+        print()
+        session.login(args.user, args.password)
+        print("  Fetching schedules...")
+        schedules = session.list_schedules()
+        print(f"  Found {len(schedules)} schedule(s).\n")
+
+    # ── Step 2: Classify ─────────────────────────────
+    healthy, problem = classify(schedules)
+
+    # ── Step 3: Report ───────────────────────────────
+    print_report(healthy, problem)
+
+    if not problem:
+        return  # nothing to do
+
+    # ── Step 4: Approve ──────────────────────────────
+    approved = prompt_approval(problem)
+
+    # ── Step 5: Fix ──────────────────────────────────
+    success, failure = fix_schedules(approved, session=session, mock=args.mock)
+
+    # ── Step 6: Summary ──────────────────────────────
+    skipped = len(problem) - len(approved)
+    print_summary(success, failure, skipped)
+
+    # ── Step 7: Audit log ────────────────────────────
+    write_audit(healthy, problem, approved, success, failure)
+
+finally:
+    if session:
+        session.logout()
+```
+
+if **name** == “**main**”:
+main()
