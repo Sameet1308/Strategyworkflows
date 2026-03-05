@@ -69,11 +69,28 @@ from datetime import datetime, timedelta, date
 from typing import Optional
 import urllib3
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)  # suppresses SSL warnings
+
+# ═════════════════════════════════════════════════════════
+
+# ★  EDIT THIS BLOCK — your server credentials  ★
+
+# ═════════════════════════════════════════════════════════
+
+MSTR_HOST     = “https://your-server/MicroStrategyLibrary”  # no trailing slash
+MSTR_USER     = “Administrator”                              # Strategy ONE username
+MSTR_PASSWORD = “yourpassword”                               # Strategy ONE password
+SSL_VERIFY    = False   # False = disable SSL cert verification (self-signed certs)
+
+# Set to True in production with a valid cert,
+
+# or set to “/path/to/ca-bundle.crt” for a custom CA
+
+# ═════════════════════════════════════════════════════════
 
 # ─────────────────────────────────────────────────────────
 
-# TUNABLES
+# TUNABLES  (less commonly changed)
 
 # ─────────────────────────────────────────────────────────
 
@@ -238,7 +255,7 @@ class StrategyOneSession:
 def __init__(self, base_url: str):
     self.base_url = base_url.rstrip("/")
     self._s = requests.Session()
-    self._s.verify = False
+    self._s.verify = SSL_VERIFY   # controlled by the config block at the top
     self._s.headers.update({"Content-Type": "application/json"})
     self.token: Optional[str] = None
 
@@ -590,16 +607,16 @@ def main():
 ap = argparse.ArgumentParser(
 description=“Strategy ONE Schedule Manager — scan, approve, and fix expired schedules.”
 )
-ap.add_argument(”–host”, help=“Library URL, e.g. https://your-server/MicroStrategyLibrary”)
-ap.add_argument(”–user”, help=“Strategy ONE username”)
-ap.add_argument(”–password”, help=“Strategy ONE password”)
+ap.add_argument(”–host”,     default=MSTR_HOST,     help=f”Library URL (default: {MSTR_HOST})”)
+ap.add_argument(”–user”,     default=MSTR_USER,     help=f”Username (default: {MSTR_USER})”)
+ap.add_argument(”–password”, default=MSTR_PASSWORD, help=“Password (default: from config block)”)
 ap.add_argument(”–mock”, action=“store_true”, help=“Use built-in mock data (no server needed)”)
 args = ap.parse_args()
 
 ```
 if not args.mock and not all([args.host, args.user, args.password]):
     ap.print_help()
-    print("\n  ERROR: --host, --user, --password are required unless using --mock\n")
+    print("\n  ERROR: Fill in MSTR_HOST / MSTR_USER / MSTR_PASSWORD in the config block at the top, or pass --host --user --password flags.\n")
     sys.exit(1)
 
 # ── Banner ───────────────────────────────────────────
