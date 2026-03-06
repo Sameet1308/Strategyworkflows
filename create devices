@@ -1,0 +1,359 @@
+# “””
+mstr_create_devices.py
+
+Replicates a reference File Device across all projects on a MicroStrategy server.
+
+Usage:
+python mstr_create_devices.py –reference-device “File Device - ProjectAlpha”
+
+The suffix after the last ’ - ’ is replaced with each project’s name to form
+the new device name, e.g.:
+Reference : “File Device - ProjectAlpha”
+New names : “File Device - ProjectBeta”, “File Device - ProjectGamma”, …
+
+Requirements:
+pip install requests
+
+Tested against MicroStrategy Library REST API (September 2025 / v2).
+“””
+
+import argparse
+import json
+import logging
+import sys
+import urllib3
+
+import requests
+
+# —————————————————————————
+
+# CONFIGURATION — fill in your values before running
+
+# —————————————————————————
+
+MSTR_BASE_URL = “https://YOUR_MSTR_SERVER/MicroStrategyLibrary”   # <– change
+USERNAME      = “YOUR_USERNAME”                                     # <– change
+PASSWORD      = “YOUR_PASSWORD”                                     # <– change
+
+# —————————————————————————
+
+# Suppress SSL warnings globally
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# —————————————————————————
+
+# Logging — console + file
+
+# —————————————————————————
+
+logging.basicConfig(
+level=logging.INFO,
+format=”%(asctime)s  %(levelname)-8s  %(message)s”,
+handlers=[
+logging.StreamHandler(sys.stdout),
+logging.FileHandler(“mstr_create_devices.log”, encoding=“utf-8”),
+],
+)
+log = logging.getLogger(**name**)
+
+# —————————————————————————
+
+# Session helper
+
+# —————————————————————————
+
+def make_session() -> requests.Session:
+s = requests.Session()
+s.verify = False
+s.headers.update({“Content-Type”: “application/json”, “Accept”: “application/json”})
+return s
+
+# —————————————————————————
+
+# Auth
+
+# —————————————————————————
+
+def login(session: requests.Session) -> str:
+“”“Authenticate and return the auth token.”””
+url = f”{MSTR_BASE_URL}/api/auth/login”
+payload = {
+“username”: USERNAME,
+“password”: PASSWORD,
+“loginMode”: 1,          # 1 = Standard auth
+}
+resp = session.post(url, json=payload)
+resp.raise_for_status()
+token = resp.headers.get(“X-MSTR-AuthToken”)
+if not token:
+raise RuntimeError(“Login succeeded but no X-MSTR-AuthToken in response headers.”)
+session.headers.update({“X-MSTR-AuthToken”: token})
+log.info(“Logged in successfully. Auth token acquired.”)
+return token
+
+def logout(session: requests.Session) -> None:
+url = f”{MSTR_BASE_URL}/api/auth/logout”
+try:
+session.post(url)
+log.info(“Logged out successfully.”)
+except Exception as exc:
+log.warning(“Logout call failed (non-fatal): %s”, exc)
+
+# —————————————————————————
+
+# Projects
+
+# —————————————————————————
+
+def get_all_projects(session: requests.Session) -> list[dict]:
+“”“Return list of all projects: [{id, name}, …]”””
+url = f”{MSTR_BASE_URL}/api/projects”
+resp = session.get(url)
+resp.raise_for_status()
+projects = resp.json()
+log.info(“Found %d project(s) on the server.”, len(projects))
+return projects
+
+# —————————————————————————
+
+# Device helpers
+
+# —————————————————————————
+
+def find_device_by_name(session: requests.Session, device_name: str, project_id: str = None) -> dict | None:
+“””
+Search for a device by exact name using the objects search API.
+Returns the first match dict or None.
+Object type 57 = Device in MSTR.
+“””
+headers = {}
+if project_id:
+headers[“X-MSTR-ProjectID”] = project_id
+
+```
+url = f"{MSTR_BASE_URL}/api/searches/results"
+params = {
+    "name":        device_name,
+    "type":        57,           # Device object type
+    "exactMatch":  True,
+    "limit":       5,
+}
+resp = session.get(url, params=params, headers=headers)
+resp.raise_for_status()
+data = resp.json()
+results = data.get("results", {}).get("objects", [])
+for obj in results:
+    if obj.get("name", "").strip().lower() == device_name.strip().lower():
+        return obj
+return None
+```
+
+def get_device_definition(session: requests.Session, device_id: str) -> dict:
+“”“Fetch full device definition by ID.”””
+url = f”{MSTR_BASE_URL}/api/devices/{device_id}”
+resp = session.get(url)
+resp.raise_for_status()
+return resp.json()
+
+def list_devices_in_project(session: requests.Session, project_id: str) -> list[dict]:
+“”“List all devices visible within a project context.”””
+url = f”{MSTR_BASE_URL}/api/devices”
+headers = {“X-MSTR-ProjectID”: project_id}
+resp = session.get(url, headers=headers)
+resp.raise_for_status()
+data = resp.json()
+# Response may be a list or wrapped in a key
+if isinstance(data, list):
+return data
+return data.get(“devices”, data.get(“items”, []))
+
+def device_exists_in_project(session: requests.Session, project_id: str, device_name: str) -> bool:
+“”“Return True if a device with device_name already exists in the project.”””
+devices = list_devices_in_project(session, project_id)
+names = [d.get(“name”, “”).strip().lower() for d in devices]
+return device_name.strip().lower() in names
+
+def create_device(session: requests.Session, project_id: str, new_name: str, reference_def: dict) -> dict:
+“””
+POST a new device to the given project, cloning the reference definition
+but with a new name.
+“””
+url = f”{MSTR_BASE_URL}/api/devices”
+headers = {“X-MSTR-ProjectID”: project_id}
+
+```
+# Build payload — strip read-only fields, replace name
+payload = {
+    "name":        new_name,
+    "description": reference_def.get("description", ""),
+    "deviceType":  reference_def.get("deviceType"),       # File device type int
+    "deviceProperties": reference_def.get("deviceProperties", {}),
+}
+
+# Some MSTR versions nest config under 'settings' or 'properties'
+for extra_key in ("settings", "properties", "outputFormat"):
+    if extra_key in reference_def:
+        payload[extra_key] = reference_def[extra_key]
+
+resp = session.post(url, json=payload, headers=headers)
+resp.raise_for_status()
+return resp.json()
+```
+
+# —————————————————————————
+
+# Name helpers
+
+# —————————————————————————
+
+def build_new_device_name(reference_name: str, project_name: str) -> str:
+“””
+Replace the suffix (after the last ’ - ’) of the reference device name
+with the project name.
+
+```
+Example:
+    reference_name = "File Device - ProjectAlpha"
+    project_name   = "ProjectBeta"
+    returns        = "File Device - ProjectBeta"
+
+If no ' - ' separator is found, appends ' - <ProjectName>'.
+"""
+sep = " - "
+if sep in reference_name:
+    prefix = reference_name.rsplit(sep, 1)[0]
+    return f"{prefix}{sep}{project_name}"
+return f"{reference_name}{sep}{project_name}"
+```
+
+# —————————————————————————
+
+# Main
+
+# —————————————————————————
+
+def parse_args() -> argparse.Namespace:
+parser = argparse.ArgumentParser(
+description=“Replicate a MicroStrategy File Device across all projects.”
+)
+parser.add_argument(
+“–reference-device”,
+required=True,
+metavar=“DEVICE_NAME”,
+help=‘Exact name of the reference device, e.g. “File Device - ProjectAlpha”’,
+)
+return parser.parse_args()
+
+def main() -> None:
+args = parse_args()
+reference_name: str = args.reference_device
+
+```
+log.info("=" * 60)
+log.info("MSTR Device Replicator")
+log.info("Reference device : %s", reference_name)
+log.info("Target server    : %s", MSTR_BASE_URL)
+log.info("=" * 60)
+
+session = make_session()
+
+# --- Login ---
+try:
+    login(session)
+except Exception as exc:
+    log.error("Login failed: %s", exc)
+    sys.exit(1)
+
+try:
+    # --- Fetch reference device (server-level search, no project context) ---
+    log.info("Searching for reference device '%s' ...", reference_name)
+    ref_obj = find_device_by_name(session, reference_name)
+    if not ref_obj:
+        log.error(
+            "Reference device '%s' not found on the server. "
+            "Check the name and ensure the user has access.",
+            reference_name,
+        )
+        sys.exit(1)
+
+    ref_id = ref_obj["id"]
+    log.info("Reference device found. ID: %s", ref_id)
+
+    ref_def = get_device_definition(session, ref_id)
+    log.info("Reference device definition fetched successfully.")
+    log.debug("Reference definition:\n%s", json.dumps(ref_def, indent=2))
+
+    # --- Fetch all projects ---
+    projects = get_all_projects(session)
+    if not projects:
+        log.warning("No projects returned from the server. Nothing to do.")
+        sys.exit(0)
+
+    # --- Summary counters ---
+    created  = 0
+    skipped  = 0
+    failed   = 0
+
+    for project in projects:
+        proj_id   = project.get("id")
+        proj_name = project.get("name", "").strip()
+
+        if not proj_id or not proj_name:
+            log.warning("Skipping project with missing id/name: %s", project)
+            continue
+
+        new_device_name = build_new_device_name(reference_name, proj_name)
+
+        log.info("-" * 50)
+        log.info("Project  : %s  (%s)", proj_name, proj_id)
+        log.info("New name : %s", new_device_name)
+
+        # --- Check if device already exists ---
+        try:
+            already_exists = device_exists_in_project(session, proj_id, new_device_name)
+        except Exception as exc:
+            log.warning(
+                "Could not check existing devices for project '%s': %s — skipping.",
+                proj_name, exc,
+            )
+            failed += 1
+            continue
+
+        if already_exists:
+            log.info("SKIPPED — device '%s' already exists in project '%s'.",
+                     new_device_name, proj_name)
+            skipped += 1
+            continue
+
+        # --- Create device ---
+        try:
+            result = create_device(session, proj_id, new_device_name, ref_def)
+            new_id = result.get("id", "unknown")
+            log.info("CREATED — '%s'  (new ID: %s)", new_device_name, new_id)
+            created += 1
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "?"
+            body   = exc.response.text[:400] if exc.response is not None else ""
+            log.error(
+                "FAILED  — Could not create device for project '%s'. "
+                "HTTP %s: %s",
+                proj_name, status, body,
+            )
+            failed += 1
+        except Exception as exc:
+            log.error("FAILED  — Unexpected error for project '%s': %s", proj_name, exc)
+            failed += 1
+
+    # --- Final summary ---
+    log.info("=" * 60)
+    log.info("DONE. Created: %d | Skipped: %d | Failed: %d", created, skipped, failed)
+    log.info("Full log saved to: mstr_create_devices.log")
+    log.info("=" * 60)
+
+finally:
+    logout(session)
+```
+
+if **name** == “**main**”:
+main()
