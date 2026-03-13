@@ -1,0 +1,406 @@
+# “””
+MSTR Datasource Audit Script
+
+Discovers all datasources, flags environment (PROD/DEV/UAT/DISC/etc.),
+maps which projects each datasource belongs to, and checks dependencies.
+
+Outputs:
+
+- mstr_datasource_audit_YYYYMMDD_HHMMSS.csv   (main report)
+- raw_datasources.json                          (for troubleshooting)
+- raw_connections.json
+- raw_logins.json
+- raw_projects.json
+
+Usage:
+python mstr_datasource_audit.py
+“””
+
+import requests
+import json
+import csv
+import re
+import time
+from datetime import datetime
+
+requests.packages.urllib3.disable_warnings()
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+
+BASE_URL = “https://your-mstr-server/MicroStrategyLibrary/api”
+USERNAME = “administrator”
+PASSWORD = “your_password”
+
+OUTPUT_CSV = f”mstr_datasource_audit_{datetime.now().strftime(’%Y%m%d_%H%M%S’)}.csv”
+
+# Object type number for database instance (DssXmlTypeDBRole = 3)
+
+DB_INSTANCE_TYPE = 3
+
+# ── ENV DETECTION PATTERNS ────────────────────────────────────────────────────
+
+# Checked case-insensitively against datasource name, connection name,
+
+# login name, and connection string — in that priority order.
+
+# Add or adjust patterns here to match your naming conventions.
+
+ENV_PATTERNS = [
+(r’*pd\b|*prd\b|*prod\b|\bprod\b|\bproduction\b|pd*|prd*|prod*’, ‘PROD’),
+(r’*dev\b|\bdev\b|*dv\b|\bdevelopment\b|dev*|dv*’,               ‘DEV’),
+(r’*uat\b|\buat\b|uat*’,                                          ‘UAT’),
+(r’*disc\b|\bdisco\b|\bdiscovery\b|disc*’,                        ‘DISC’),
+(r’*stg\b|*stage\b|\bstaging\b|stg*|stage*’,                     ‘STAGE’),
+(r’*qa\b|\bqa\b|qa*’,                                             ‘QA’),
+]
+
+# ── AUTH ──────────────────────────────────────────────────────────────────────
+
+def mstr_login(base_url, username, password):
+resp = requests.post(
+f”{base_url}/auth/login”,
+json={“username”: username, “password”: password, “loginMode”: 1},
+verify=False
+)
+resp.raise_for_status()
+print(f”  ✅ Logged in as {username}”)
+return resp.headers[“X-MSTR-AuthToken”]
+
+def mstr_logout(base_url, auth_token):
+requests.post(
+f”{base_url}/auth/logout”,
+headers={“X-MSTR-AuthToken”: auth_token},
+verify=False
+)
+print(”  ✅ Logged out”)
+
+# ── FETCH HELPERS ─────────────────────────────────────────────────────────────
+
+def get_json(base_url, auth_token, path):
+resp = requests.get(
+f”{base_url}{path}”,
+headers={“X-MSTR-AuthToken”: auth_token, “Accept”: “application/json”},
+verify=False
+)
+resp.raise_for_status()
+return resp.json()
+
+def save_raw(data, filename):
+with open(filename, “w”, encoding=“utf-8”) as f:
+json.dump(data, f, indent=2)
+
+# ── ENV DETECTION ─────────────────────────────────────────────────────────────
+
+def detect_env(text, field_label):
+“”“Run each pattern against text. Returns (env, matched_on) or (None, None).”””
+if not text:
+return None, None
+for pattern, env in ENV_PATTERNS:
+if re.search(pattern, text, re.IGNORECASE):
+return env, f”{field_label}: ‘{text}’”
+return None, None
+
+def classify_datasource(ds_name, conn_name, login_name, conn_string):
+“””
+Try fields in priority order:
+1. datasource name  (most reliable — admins usually suffix this)
+2. connection name
+3. login name
+4. connection string  (last — long and noisy)
+Returns (environment, matched_on_description)
+“””
+for text, label in [
+(ds_name,     “datasource_name”),
+(conn_name,   “connection_name”),
+(login_name,  “login_name”),
+(conn_string, “connection_string”),
+]:
+env, matched_on = detect_env(text, label)
+if env:
+return env, matched_on
+return “UNKNOWN”, “no pattern matched — review manually”
+
+# ── LOOKUP MAP BUILDERS ───────────────────────────────────────────────────────
+
+def build_map(response, *list_keys):
+“””
+Extract a list from a response dict trying multiple key names,
+then return a {id: item} dict.
+“””
+items = response
+if isinstance(response, dict):
+for key in list_keys:
+if key in response:
+items = response[key]
+break
+else:
+# If none of the keys match, try the first list value we find
+items = next(
+(v for v in response.values() if isinstance(v, list)), []
+)
+return {item[“id”]: item for item in items if “id” in item}
+
+# ── PROJECT → DATASOURCE MAPPING ─────────────────────────────────────────────
+
+def build_project_datasource_map(base_url, auth_token, projects):
+“””
+For each project, call GET /api/projects/{projectId}/datasources.
+Returns an inverted map: {datasource_id: [project_name, …]}
+Also returns {project_id: project_name} for reference.
+“””
+ds_to_projects = {}   # datasource_id -> list of project names
+project_names  = {}   # project_id -> project_name
+
+```
+for proj in projects:
+    proj_id   = proj.get("id", "")
+    proj_name = proj.get("name", "")
+    if not proj_id:
+        continue
+    project_names[proj_id] = proj_name
+
+    try:
+        resp = get_json(base_url, auth_token, f"/projects/{proj_id}/datasources")
+        # Response is {"datasources": [...]}
+        ds_list = resp.get("datasources", resp if isinstance(resp, list) else [])
+        for ds in ds_list:
+            ds_id = ds.get("id", "")
+            if ds_id:
+                ds_to_projects.setdefault(ds_id, []).append(proj_name)
+        print(f"    Project '{proj_name}': {len(ds_list)} datasource(s)")
+    except requests.HTTPError as e:
+        print(f"    ⚠️  Could not fetch datasources for project '{proj_name}': {e}")
+
+return ds_to_projects, project_names
+```
+
+# ── DEPENDENCY CHECK ──────────────────────────────────────────────────────────
+
+def check_dependencies(base_url, auth_token, datasource_id, obj_type=DB_INSTANCE_TYPE):
+“””
+Two-step metadata search:
+POST /api/metadataSearches/results?usesObject={id};{type}
+→ triggers search, stores results in IS memory
+GET  /api/metadataSearches/results
+→ retrieves stored results
+
+```
+Returns list of dependent objects (may be empty).
+NOTE: searches cannot run in parallel in one session — sequential only.
+"""
+headers = {"X-MSTR-AuthToken": auth_token, "Accept": "application/json"}
+
+# Step 1 — trigger search
+post_resp = requests.post(
+    f"{base_url}/metadataSearches/results",
+    headers=headers,
+    params={
+        "domain": 2,
+        "usesObject": f"{datasource_id};{obj_type}",
+        "usesRecursive": "false"
+    },
+    verify=False
+)
+post_resp.raise_for_status()
+
+# Brief pause for IS to complete the search
+time.sleep(0.8)
+
+# Step 2 — retrieve results
+get_resp = requests.get(
+    f"{base_url}/metadataSearches/results",
+    headers=headers,
+    verify=False
+)
+get_resp.raise_for_status()
+data = get_resp.json()
+
+# Results are usually under 'result' key as a list
+return data.get("result", data if isinstance(data, list) else [])
+```
+
+def format_dependencies(dep_list):
+“””
+Flatten dependency list into two CSV-friendly strings:
+dep_count       — integer count
+dep_summary     — “TypeName: ObjName (ID) | TypeName: ObjName (ID) | …”
+“””
+count = len(dep_list)
+if count == 0:
+return 0, “none”
+parts = []
+for item in dep_list:
+obj_type = item.get(“type”, “?”)
+obj_name = item.get(“name”, “unknown”)
+obj_id   = item.get(“id”, “unknown”)
+parts.append(f”[type={obj_type}] {obj_name} ({obj_id})”)
+return count, “ | “.join(parts)
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+
+if **name** == “**main**”:
+
+```
+print("\n" + "="*60)
+print("  MSTR DATASOURCE AUDIT")
+print("="*60)
+
+auth_token = mstr_login(BASE_URL, USERNAME, PASSWORD)
+
+try:
+    # ── FETCH ALL RAW DATA ────────────────────────────────────────────────
+    print("\n[1/4] Fetching datasources, connections, logins, projects...")
+
+    ds_raw    = get_json(BASE_URL, auth_token, "/datasources")
+    conn_raw  = get_json(BASE_URL, auth_token, "/datasources/connections")
+    login_raw = get_json(BASE_URL, auth_token, "/datasources/logins")
+    proj_raw  = get_json(BASE_URL, auth_token, "/projects")
+
+    save_raw(ds_raw,    "raw_datasources.json")
+    save_raw(conn_raw,  "raw_connections.json")
+    save_raw(login_raw, "raw_logins.json")
+    save_raw(proj_raw,  "raw_projects.json")
+    print("  Raw JSON saved to raw_*.json files")
+
+    # ── BUILD LOOKUP MAPS ─────────────────────────────────────────────────
+    conn_map  = build_map(conn_raw,  "datasourceConnections", "connections")
+    login_map = build_map(login_raw, "datasourceLogins",      "logins")
+
+    # Normalise project list
+    projects = proj_raw if isinstance(proj_raw, list) \
+               else proj_raw.get("projects", [])
+
+    # Normalise datasource list
+    ds_list = ds_raw if isinstance(ds_raw, list) \
+              else ds_raw.get("datasources",
+                   ds_raw.get("datasourceInstances", []))
+
+    print(f"  Found: {len(ds_list)} datasources | "
+          f"{len(conn_map)} connections | "
+          f"{len(login_map)} logins | "
+          f"{len(projects)} projects")
+
+    # ── PROJECT → DATASOURCE MAP ──────────────────────────────────────────
+    print("\n[2/4] Mapping datasources to projects...")
+    ds_to_projects, _ = build_project_datasource_map(
+        BASE_URL, auth_token, projects
+    )
+
+    # ── DEPENDENCY CHECKS ─────────────────────────────────────────────────
+    print(f"\n[3/4] Checking dependencies for {len(ds_list)} datasource(s)...")
+    print("  (sequential — one at a time per MSTR API restriction)")
+
+    dep_cache = {}   # datasource_id -> dep_list
+    for i, ds in enumerate(ds_list, 1):
+        ds_id   = ds.get("id", "")
+        ds_name = ds.get("name", "")
+        print(f"  [{i}/{len(ds_list)}] {ds_name}...", end=" ", flush=True)
+        try:
+            deps = check_dependencies(BASE_URL, auth_token, ds_id)
+            dep_cache[ds_id] = deps
+            print(f"{len(deps)} dependent(s)")
+        except Exception as e:
+            dep_cache[ds_id] = []
+            print(f"⚠️  error: {e}")
+
+    # ── BUILD CSV ROWS ────────────────────────────────────────────────────
+    print(f"\n[4/4] Building CSV...")
+
+    env_summary = {}
+    rows = []
+
+    for ds in ds_list:
+        ds_id   = ds.get("id", "")
+        ds_name = ds.get("name", "")
+
+        # --- Connection info ---
+        db_block    = ds.get("database", {})
+        conn_ref    = db_block.get("connection", {})
+        conn_id     = conn_ref.get("id", "")
+        conn_detail = conn_map.get(conn_id, {})
+        conn_name   = conn_detail.get("name",             conn_ref.get("name", ""))
+        conn_string = conn_detail.get("connectionString", "")
+
+        # --- Login info ---
+        login_ref    = db_block.get("login", {})
+        login_id     = login_ref.get("id", "")
+        login_detail = login_map.get(login_id, {})
+        login_name   = login_detail.get("name", login_ref.get("name", ""))
+
+        # --- Environment flag ---
+        env, matched_on = classify_datasource(
+            ds_name, conn_name, login_name, conn_string
+        )
+        env_summary[env] = env_summary.get(env, 0) + 1
+
+        # --- Project mapping ---
+        proj_list     = ds_to_projects.get(ds_id, [])
+        project_count = len(proj_list)
+        project_names_str = " | ".join(proj_list) if proj_list else "not mapped to any project"
+
+        # --- Dependencies ---
+        dep_list              = dep_cache.get(ds_id, [])
+        dep_count, dep_summary = format_dependencies(dep_list)
+
+        # --- Safe to delete? ---
+        safe_to_delete = "YES" if dep_count == 0 and project_count == 0 else "NO"
+
+        rows.append({
+            "datasource_id":       ds_id,
+            "datasource_name":     ds_name,
+            "environment":         env,
+            "matched_on":          matched_on,
+            "datasource_type":     ds.get("datasourceType", ""),
+            "date_modified":       ds.get("dateModified", ""),
+            # Connection
+            "connection_id":       conn_id,
+            "connection_name":     conn_name,
+            "connection_string":   conn_string,
+            # Login
+            "login_id":            login_id,
+            "login_name":          login_name,
+            # Projects
+            "project_count":       project_count,
+            "projects":            project_names_str,
+            # Dependencies
+            "dependency_count":    dep_count,
+            "dependencies":        dep_summary,
+            # Summary
+            "safe_to_delete":      safe_to_delete,
+        })
+
+    # ── WRITE CSV ─────────────────────────────────────────────────────────
+    fieldnames = [
+        "datasource_id",    "datasource_name",   "environment",
+        "matched_on",       "datasource_type",   "date_modified",
+        "connection_id",    "connection_name",   "connection_string",
+        "login_id",         "login_name",
+        "project_count",    "projects",
+        "dependency_count", "dependencies",
+        "safe_to_delete",
+    ]
+
+    with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    # ── SUMMARY ───────────────────────────────────────────────────────────
+    safe_count    = sum(1 for r in rows if r["safe_to_delete"] == "YES")
+    blocked_count = len(rows) - safe_count
+
+    print(f"\n{'='*60}")
+    print(f"  CSV written: {OUTPUT_CSV}  ({len(rows)} datasources)")
+    print(f"{'='*60}")
+    print(f"\n  Environment Breakdown:")
+    for env, count in sorted(env_summary.items()):
+        print(f"    {env:<10} {count}")
+    print(f"    {'TOTAL':<10} {len(rows)}")
+    print(f"\n  Deletion Safety:")
+    print(f"    Safe to delete    {safe_count}")
+    print(f"    Blocked           {blocked_count}")
+    print(f"    (blocked = has dependencies or is mapped to at least one project)")
+
+finally:
+    mstr_logout(BASE_URL, auth_token)
+```
