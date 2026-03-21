@@ -1,0 +1,181 @@
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$EventId,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateSet("onprem", "cloud")]
+    [string]$Env
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+# =========================================================
+# CONFIG
+# =========================================================
+# Replace with your actual values
+
+$Username = "myuser"
+$Password = "mypassword"
+
+# Set to $true only if SSL certificate validation causes failures
+$SkipCertificateCheck = $true
+
+$config = @{
+    onprem = @{
+        BaseUrl   = "https://your-onprem-server/MicroStrategyLibrary"
+        Username  = $Username
+        Password  = $Password
+        LoginMode = 1
+    }
+    cloud = @{
+        BaseUrl   = "https://your-cloud-server/MicroStrategyLibrary"
+        Username  = $Username
+        Password  = $Password
+        LoginMode = 1
+    }
+}
+
+# =========================================================
+# HELPERS
+# =========================================================
+function Get-HttpErrorDetails {
+    param($ErrorRecord)
+
+    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+        return $ErrorRecord.ErrorDetails.Message
+    }
+
+    try {
+        $resp = $ErrorRecord.Exception.Response
+        if ($null -ne $resp) {
+            $stream = $resp.GetResponseStream()
+            if ($null -ne $stream) {
+                $reader = New-Object System.IO.StreamReader($stream)
+                $body = $reader.ReadToEnd()
+                if (-not [string]::IsNullOrWhiteSpace($body)) {
+                    return $body
+                }
+            }
+        }
+    }
+    catch {
+    }
+
+    return $ErrorRecord.Exception.Message
+}
+
+function Enable-InsecureSslIfNeeded {
+    param([bool]$SkipSsl)
+
+    if (-not $SkipSsl) {
+        return
+    }
+
+    if ($PSVersionTable.PSVersion.Major -lt 6) {
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = `
+                [Net.SecurityProtocolType]::Tls12 -bor `
+                [Net.SecurityProtocolType]::Tls11 -bor `
+                [Net.SecurityProtocolType]::Tls
+        }
+        catch {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        }
+
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+    }
+}
+
+function Get-CommonInvokeParams {
+    param([bool]$SkipSsl)
+
+    Enable-InsecureSslIfNeeded -SkipSsl:$SkipSsl
+
+    $params = @{
+        ErrorAction = "Stop"
+    }
+
+    if ($PSVersionTable.PSVersion.Major -ge 6 -and $SkipSsl) {
+        $params["SkipCertificateCheck"] = $true
+    }
+
+    return $params
+}
+
+# =========================================================
+# MAIN
+# =========================================================
+$envConfig = $config[$Env]
+$commonParams = Get-CommonInvokeParams -SkipSsl:$SkipCertificateCheck
+
+$session = $null
+$token = $null
+
+try {
+    Write-Host "[$Env] Logging in..."
+
+    $loginBody = @{
+        username  = $envConfig.Username
+        password  = $envConfig.Password
+        loginMode = $envConfig.LoginMode
+    } | ConvertTo-Json -Depth 5
+
+    $loginResponse = Invoke-WebRequest `
+        -Method POST `
+        -Uri "$($envConfig.BaseUrl)/api/auth/login" `
+        -Body $loginBody `
+        -ContentType "application/json" `
+        -SessionVariable session `
+        @commonParams
+
+    $token = $loginResponse.Headers["X-MSTR-AuthToken"]
+
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        throw "Login succeeded but X-MSTR-AuthToken was not returned."
+    }
+
+    Write-Host "[$Env] Triggering event '$EventId'..."
+
+    $headers = @{
+        "X-MSTR-AuthToken" = $token
+        "Accept"           = "application/json"
+    }
+
+    Invoke-RestMethod `
+        -Method POST `
+        -Uri "$($envConfig.BaseUrl)/api/events/$EventId/trigger" `
+        -Headers $headers `
+        -WebSession $session `
+        @commonParams | Out-Null
+
+    Write-Host "[$Env] SUCCESS - Event '$EventId' triggered."
+    exit 0
+}
+catch {
+    $err = Get-HttpErrorDetails $_
+    Write-Error "[$Env] FAILED - Event '$EventId' - $err"
+    exit 1
+}
+finally {
+    if ($null -ne $session -and -not [string]::IsNullOrWhiteSpace($token)) {
+        try {
+            Write-Host "[$Env] Logging out..."
+
+            $logoutHeaders = @{
+                "X-MSTR-AuthToken" = $token
+                "Accept"           = "application/json"
+            }
+
+            Invoke-RestMethod `
+                -Method POST `
+                -Uri "$($envConfig.BaseUrl)/api/auth/logout" `
+                -Headers $logoutHeaders `
+                -WebSession $session `
+                @commonParams | Out-Null
+        }
+        catch {
+            Write-Warning "[$Env] Logout failed: $(Get-HttpErrorDetails $_)"
+        }
+    }
+}
