@@ -1,0 +1,1565 @@
+# “””
+
+# MSTR ACL AUDIT — Full Coverage, Production Ready
+
+Version : 3.0
+
+WHAT THIS SCRIPT DOES:
+Connects to 3 MicroStrategy servers (DEV / UAT / PROD), loops through all
+projects on each server and produces a complete access control audit covering:
+- Who is a member of each project (User Manager / Project Membership)
+- Who has ACL rights on the project object itself
+- Who has ACL rights on every folder (Public Objects, Schema Objects,
+and all child folders) down to depth 7
+- Full inheritance chain — direct vs inherited per folder
+
+COVERAGE:
+✅ Project membership  — groups/users added via User Manager
+✅ Project-level ACL   — rights on the project object itself
+✅ Public Objects      — root + all subfolders to depth 7
+✅ Schema Objects      — root + Attributes, Facts, Hierarchies, Tables, etc.
+✅ All predefined root folders
+✅ AD/LDAP groups (trusteeSubtype 8705)
+✅ Individual users directly assigned (trusteeSubtype 8704)
+✅ Paginated folder reads — no contents silently truncated
+✅ Inheritance chain tracked at every level
+✅ SSL verify=False, urllib3 warnings suppressed
+
+OUTPUTS (written to ./mstr_acl_output/):
+
+1. dev_context.json / uat_context.json / prod_context.json  — RAG-ready JSON
+1. dev_ai_context.md / uat_ai_context.md / prod_ai_context.md — LLM markdown
+1. all_environments_acl.csv   — flat CSV, all decoded fields, all 3 envs
+1. project_membership.csv     — who is a project member across all 3 envs
+1. mstr_acl_audit.log         — full run log
+
+REQUIREMENTS:
+pip install requests
+
+URL FORMAT:
+Set base_url to: https://your-server.com/MicroStrategyLibrarySTD
+Do NOT include /api — the script appends that in every call automatically.
+
+LOGIN MODE:
+loginMode 1  = Standard (username/password)
+loginMode 8  = Windows / Network (NTLM)
+loginMode 16 = LDAP
+Update LOGIN_MODE below to match your environment.
+
+USAGE:
+
+1. Update ENVIRONMENTS and LOGIN_MODE below
+1. python mstr_acl_audit_v3.py
+   ================================================================================
+   “””
+
+# ── Standard library ──────────────────────────────────────────────────────────
+
+import csv
+import json
+import logging
+import sys
+from collections import defaultdict
+from copy import deepcopy
+from datetime import datetime
+from pathlib import Path
+
+# ── Third-party ───────────────────────────────────────────────────────────────
+
+try:
+import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except ImportError:
+print(“ERROR: ‘requests’ library not found.  Run: pip install requests”)
+sys.exit(1)
+
+# =============================================================================
+
+# CONFIGURATION  ←  ONLY SECTION YOU NEED TO EDIT
+
+# =============================================================================
+
+ENVIRONMENTS = [
+{
+“env”:      “DEV”,
+“base_url”: “https://your-dev-server.com/MicroStrategyLibrarySTD”,
+“username”: “your_username”,
+“password”: “your_password”,
+},
+{
+“env”:      “UAT”,
+“base_url”: “https://your-uat-server.com/MicroStrategyLibrarySTD”,
+“username”: “your_username”,
+“password”: “your_password”,
+},
+{
+“env”:      “PROD”,
+“base_url”: “https://your-prod-server.com/MicroStrategyLibrarySTD”,
+“username”: “your_username”,
+“password”: “your_password”,
+},
+]
+
+# Login mode: 1=Standard  8=Windows/NTLM  16=LDAP
+
+LOGIN_MODE = 1
+
+# How many folder levels deep to recurse (7 = maximum)
+
+MAX_DEPTH = 7
+
+# Page size for paginated API calls (folders with many children)
+
+PAGE_LIMIT = 200
+
+# Output directory
+
+OUTPUT_DIR = Path(”./mstr_acl_output”)
+
+# SSL — internal servers typically use self-signed certs
+
+SSL_VERIFY = False
+
+# =============================================================================
+
+# CONSTANTS  ←  DO NOT CHANGE
+
+# =============================================================================
+
+FOLDER_TYPE  = 8    # EnumDSSXMLObjectTypes: DssXmlTypeFolder
+PROJECT_TYPE = 32   # EnumDSSXMLObjectTypes: DssXmlTypeProject
+
+# Trustee subtypes we capture
+
+# 8704 = Individual user account (EnumDSSXMLObjectSubTypes: DssXmlSubTypeUser)
+
+# 8705 = User group — AD/LDAP groups (DssXmlSubTypeUserGroup)
+
+INCLUDED_TRUSTEE_SUBTYPES = {8704, 8705}
+
+# Predefined root folder IDs (EnumDSSXMLFolderNames)
+
+# Script tries all, deduplicates by GUID — same folder never walked twice
+
+PREDEFINED_ROOT_FOLDERS = [
+{“type_id”: 14, “label”: “Public Objects”,
+“description”: “Top-level public container for all user-facing MSTR objects”},
+{“type_id”: 7,  “label”: “Public Objects / Shared Reports”,
+“description”: “Shared reports and dashboards visible to end users”},
+{“type_id”: 16, “label”: “Schema Objects”,
+“description”: “Top-level schema container”},
+{“type_id”: 17, “label”: “Schema Objects / Attributes”,
+“description”: “Attribute definitions”},
+{“type_id”: 18, “label”: “Schema Objects / Facts”,
+“description”: “Fact definitions”},
+{“type_id”: 19, “label”: “Schema Objects / Hierarchies”,
+“description”: “Hierarchy definitions”},
+{“type_id”: 21, “label”: “Schema Objects / Tables”,
+“description”: “Logical table definitions”},
+{“type_id”: 22, “label”: “Schema Objects / Transformations”,
+“description”: “Transformation objects”},
+{“type_id”: 23, “label”: “Schema Objects / Subtotals”,
+“description”: “Custom subtotal definitions”},
+{“type_id”: 24, “label”: “Schema Objects / Data Explorer”,
+“description”: “Data Explorer folder”},
+{“type_id”: 25, “label”: “Schema Objects / Partition Mappings”,
+“description”: “Partition mapping objects”},
+]
+
+# Encoding lookup tables
+
+TRUSTEE_TYPE_DESC = {
+34: “User or User Group”,
+32: “Project”,
+8:  “Folder”,
+}
+
+TRUSTEE_SUBTYPE_DESC = {
+8704: “Individual User Account”,
+8705: “User Group (AD Group / LDAP Group)”,
+-1:   “Unknown / Unspecified”,
+}
+
+ACE_TYPE_DESC = {
+1: “Standard ACE (Grant or Deny access)”,
+}
+
+RIGHTS_BITS = {
+1:   “Execute”,
+2:   “Use / MicroStrategy Web”,
+4:   “Browse”,
+8:   “Read”,
+16:  “Write”,
+32:  “Delete”,
+64:  “Control (Modify ACL)”,
+128: “Full Control (Admin Flag)”,
+}
+
+COMMON_RIGHTS_COMBOS = {
+0:   “No Permissions”,
+5:   “Browse + Execute (Public/Guest minimal)”,
+12:  “Browse + Read (Read-only analyst)”,
+28:  “Browse + Read + Write (Power user / developer)”,
+60:  “Browse + Read + Write + Delete (Content manager)”,
+199: “Execute + Use + Browse + Read + Write + Delete + Control (Standard full editor)”,
+255: “Full Control (All permissions — unrestricted)”,
+}
+
+# CSV columns — ACL records
+
+CSV_ACL_FIELDNAMES = [
+“environment”, “server”, “project”,
+“record_type”,           # project_acl | folder_acl
+“folder_tree_section”,   # Project ACL | Public Objects | Schema Objects | Other
+“folder_depth”,          # -1 = project level, 0 = root, 1-7 = nested
+“folder_path”,
+“folder_name”,
+“folder_id”,
+“trustee_name”,
+“trustee_id”,
+“trustee_type_int”,
+“trustee_type_desc”,
+“trustee_subtype_int”,
+“trustee_subtype_desc”,
+“trustee_category”,      # “User Group (AD/LDAP)” | “Individual User Account”
+“ace_type_int”,
+“ace_type_desc”,
+“rights_int”,
+“permissions_decoded”,
+“combo_description”,
+“inheritable”,
+“inheritable_desc”,
+“deny”,
+“acl_source”,            # direct | inherited
+“acl_source_detail”,
+“generated_at”,
+]
+
+# CSV columns — project membership records
+
+CSV_MEMBERSHIP_FIELDNAMES = [
+“environment”,
+“server”,
+“project”,
+“project_id”,
+“member_name”,
+“member_id”,
+“member_type”,           # user | group
+“member_subtype_int”,
+“member_subtype_desc”,
+“member_category”,       # “User Group (AD/LDAP)” | “Individual User Account”
+“source”,                # “project_membership”
+“generated_at”,
+]
+
+# =============================================================================
+
+# LOGGING SETUP
+
+# =============================================================================
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+level=logging.INFO,
+format=”%(asctime)s [%(levelname)s] %(message)s”,
+handlers=[
+logging.FileHandler(OUTPUT_DIR / “mstr_acl_audit.log”, encoding=“utf-8”),
+logging.StreamHandler(sys.stdout),
+],
+)
+log = logging.getLogger(**name**)
+
+# =============================================================================
+
+# DECODING HELPERS
+
+# =============================================================================
+
+def decode_rights(rights: int) -> dict:
+“””
+Decode a rights integer into individual permission names and a
+plain-English combo label.
+Always returns a dict with: permissions_list, permissions_decoded,
+combo_description.  Never raises.
+“””
+try:
+rights = int(rights)
+except (TypeError, ValueError):
+rights = 0
+
+```
+if rights >= 255:
+    return {
+        "permissions_list":    ["Full Control"],
+        "permissions_decoded": "Full Control",
+        "combo_description":   COMMON_RIGHTS_COMBOS[255],
+    }
+if rights == 0:
+    return {
+        "permissions_list":    [],
+        "permissions_decoded": "No Permissions (0)",
+        "combo_description":   COMMON_RIGHTS_COMBOS[0],
+    }
+individual = [label for bit, label in RIGHTS_BITS.items() if rights & bit]
+combo = COMMON_RIGHTS_COMBOS.get(rights, " + ".join(individual))
+return {
+    "permissions_list":    individual,
+    "permissions_decoded": ", ".join(individual) if individual else "No Permissions (0)",
+    "combo_description":   combo,
+}
+```
+
+def decode_trustee_type(type_int) -> str:
+try:
+return TRUSTEE_TYPE_DESC.get(int(type_int), f”Unknown type ({type_int})”)
+except (TypeError, ValueError):
+return f”Unknown type ({type_int})”
+
+def decode_trustee_subtype(subtype_int) -> str:
+try:
+return TRUSTEE_SUBTYPE_DESC.get(int(subtype_int), f”Unknown subtype ({subtype_int})”)
+except (TypeError, ValueError):
+return f”Unknown subtype ({subtype_int})”
+
+def decode_ace_type(type_int) -> str:
+try:
+return ACE_TYPE_DESC.get(int(type_int), f”Unknown ACE type ({type_int})”)
+except (TypeError, ValueError):
+return f”Unknown ACE type ({type_int})”
+
+def decode_inheritable(flag) -> str:
+return (
+“Inheritable — new objects in this folder will receive this ACE”
+if bool(flag)
+else “Not inheritable — applies to this folder only”
+)
+
+def trustee_category(subtype_int) -> str:
+try:
+return (
+“User Group (AD/LDAP)”
+if int(subtype_int) == 8705
+else “Individual User Account”
+)
+except (TypeError, ValueError):
+return “Unknown”
+
+def get_tree_section(record: dict) -> str:
+“”“Classify a record into a named tree section for reporting.”””
+if record.get(“record_type”) == “project_acl”:
+return “Project ACL”
+path = record.get(“folder_path”, “”)
+if “Schema Objects” in path:
+return “Schema Objects”
+if “Public Objects” in path:
+return “Public Objects”
+return “Other Root Folder”
+
+# =============================================================================
+
+# SAFE HTTP HELPER
+
+# Wraps every request in consistent error handling.
+
+# Returns (response_or_None, error_string_or_None)
+
+# =============================================================================
+
+def safe_get(url: str, token: str, project_id: str = “”, params: dict = None) -> tuple:
+“””
+Perform a GET request with auth headers.
+Returns (parsed_json, None) on success.
+Returns (None, error_message) on any failure.
+Never raises.
+“””
+headers = {“X-MSTR-AuthToken”: token}
+if project_id:
+headers[“X-MSTR-ProjectID”] = project_id
+try:
+resp = requests.get(
+url,
+headers=headers,
+params=params or {},
+verify=SSL_VERIFY,
+timeout=30,
+)
+resp.raise_for_status()
+return resp.json(), None
+except requests.exceptions.Timeout:
+return None, f”Timeout on GET {url}”
+except requests.exceptions.ConnectionError as e:
+return None, f”Connection error on GET {url}: {e}”
+except requests.exceptions.HTTPError as e:
+return None, f”HTTP {e.response.status_code} on GET {url}: {e}”
+except ValueError as e:
+return None, f”JSON decode error on GET {url}: {e}”
+except Exception as e:
+return None, f”Unexpected error on GET {url}: {e}”
+
+# =============================================================================
+
+# AUTHENTICATION
+
+# =============================================================================
+
+def login(base_url: str, username: str, password: str) -> str:
+“””
+POST /api/auth/login.
+Returns auth token string.
+Raises ValueError on failure so the caller can skip this environment.
+“””
+url = f”{base_url}/api/auth/login”
+try:
+resp = requests.post(
+url,
+json={“username”: username, “password”: password, “loginMode”: LOGIN_MODE},
+headers={“Content-Type”: “application/json”},
+verify=SSL_VERIFY,
+timeout=30,
+)
+resp.raise_for_status()
+token = resp.headers.get(“X-MSTR-AuthToken”, “”)
+if not token:
+raise ValueError(“Login succeeded but X-MSTR-AuthToken was missing in response headers.”)
+return token
+except requests.exceptions.ConnectionError:
+raise ValueError(
+f”Cannot connect to {url}. “
+“Verify the URL, VPN, and that MicroStrategy Library is running.”
+)
+except requests.exceptions.HTTPError as e:
+raise ValueError(f”Login HTTP error: {e}”)
+except Exception as e:
+raise ValueError(f”Login failed: {e}”)
+
+def logout(base_url: str, token: str) -> None:
+“”“POST /api/auth/logout — silently swallows all errors.”””
+try:
+requests.post(
+f”{base_url}/api/auth/logout”,
+headers={“X-MSTR-AuthToken”: token},
+verify=SSL_VERIFY,
+timeout=10,
+)
+except Exception:
+pass
+
+# =============================================================================
+
+# PROJECTS
+
+# =============================================================================
+
+def get_all_projects(base_url: str, token: str) -> list:
+“””
+GET /api/projects
+Returns list of project dicts.  Returns [] on failure.
+“””
+data, err = safe_get(f”{base_url}/api/projects”, token)
+if err:
+log.warning(f”  [WARN] Could not fetch projects: {err}”)
+return []
+if not isinstance(data, list):
+log.warning(f”  [WARN] /api/projects returned unexpected type: {type(data)}”)
+return []
+return data
+
+# =============================================================================
+
+# ★ PROJECT MEMBERSHIP
+
+# Captures every group and user added to a project via User Manager.
+
+# This is separate from folder ACLs — a principal can be a project member
+
+# without having any explicit folder ACE (they inherit from project membership).
+
+# =============================================================================
+
+def get_project_members(
+base_url: str, token: str,
+project_id: str, project_name: str,
+env: str, server: str, generated_at: str
+) -> list:
+“””
+Fetch all user groups and users that are members of a project.
+
+```
+Tries two endpoints used across MSTR versions:
+  1. GET /api/projects/{id}/userGroups   — groups
+  2. GET /api/projects/{id}/users        — individual users
+
+Returns a list of membership record dicts ready for the CSV.
+"""
+membership_records = []
+
+# ── Groups ────────────────────────────────────────────────────────────────
+groups_url = f"{base_url}/api/projects/{project_id}/userGroups"
+data, err  = safe_get(groups_url, token)
+if err:
+    log.warning(f"    [WARN] Project groups fetch failed for '{project_name}': {err}")
+else:
+    items = data if isinstance(data, list) else data.get("userGroups", []) if isinstance(data, dict) else []
+    for item in items:
+        subtype = item.get("subtype", 8705)
+        membership_records.append({
+            "environment":        env,
+            "server":             server,
+            "project":            project_name,
+            "project_id":         project_id,
+            "member_name":        item.get("name", "Unknown"),
+            "member_id":          item.get("id", ""),
+            "member_type":        "group",
+            "member_subtype_int": subtype,
+            "member_subtype_desc": decode_trustee_subtype(subtype),
+            "member_category":    trustee_category(subtype),
+            "source":             "project_membership",
+            "generated_at":       generated_at,
+        })
+    log.info(f"      Project groups: {len(items)} found")
+
+# ── Individual users ──────────────────────────────────────────────────────
+users_url = f"{base_url}/api/projects/{project_id}/users"
+data, err = safe_get(users_url, token)
+if err:
+    log.warning(f"    [WARN] Project users fetch failed for '{project_name}': {err}")
+else:
+    items = data if isinstance(data, list) else data.get("users", []) if isinstance(data, dict) else []
+    for item in items:
+        subtype = item.get("subtype", 8704)
+        membership_records.append({
+            "environment":        env,
+            "server":             server,
+            "project":            project_name,
+            "project_id":         project_id,
+            "member_name":        item.get("name", "Unknown"),
+            "member_id":          item.get("id", ""),
+            "member_type":        "user",
+            "member_subtype_int": subtype,
+            "member_subtype_desc": decode_trustee_subtype(subtype),
+            "member_category":    trustee_category(subtype),
+            "source":             "project_membership",
+            "generated_at":       generated_at,
+        })
+    log.info(f"      Project users: {len(items)} found")
+
+return membership_records
+```
+
+# =============================================================================
+
+# PROJECT-LEVEL ACL
+
+# =============================================================================
+
+def get_project_acl_record(
+base_url: str, token: str,
+project_id: str, project_name: str,
+env: str, server: str, generated_at: str
+) -> dict:
+“””
+Fetch ACL on the project object itself (type=32).
+Returns a synthetic record shaped like a folder record so it flows
+through the same export pipeline.  depth=-1 means project level.
+“””
+data, err = safe_get(
+f”{base_url}/api/objects/{project_id}/acl”,
+token,
+params={“type”: PROJECT_TYPE},
+)
+if err:
+log.warning(f”    [WARN] Project ACL fetch failed for ‘{project_name}’: {err}”)
+acl_raw = []
+else:
+acl_raw = data.get(“acl”, []) if isinstance(data, dict) else []
+
+```
+direct_acl = parse_acl_entries(
+    acl_raw,
+    source_label="direct",
+    source_detail="Assigned directly on the project object",
+)
+
+record = {
+    "environment":    env,
+    "server":         server,
+    "project":        project_name,
+    "project_id":     project_id,
+    "folder_name":    f"[PROJECT ROOT] {project_name}",
+    "folder_path":    f"[PROJECT ROOT] {project_name}",
+    "folder_id":      project_id,
+    "depth":          -1,
+    "record_type":    "project_acl",
+    "direct_acl":     direct_acl,
+    "inherited_acl":  [],
+    "effective_acl":  direct_acl,
+    "children":       [],
+    "generated_at":   generated_at,
+    "markdown_chunk": "",
+}
+record["markdown_chunk"] = build_markdown_chunk(record)
+return record
+```
+
+# =============================================================================
+
+# ROOT FOLDER DISCOVERY
+
+# =============================================================================
+
+def get_all_root_folders(base_url: str, token: str, project_id: str) -> list:
+“””
+Try every predefined root folder type ID and collect unique folders.
+Deduplicates by folder GUID — same physical folder never walked twice.
+Returns list of {“id”: …, “label”: …, “description”: …}
+“””
+seen_ids   = set()
+discovered = []
+
+```
+for predef in PREDEFINED_ROOT_FOLDERS:
+    type_id     = predef["type_id"]
+    label       = predef["label"]
+    description = predef["description"]
+
+    data, err = safe_get(
+        f"{base_url}/api/folders/preDefined/{type_id}",
+        token,
+        project_id=project_id,
+    )
+    if err:
+        log.debug(f"      preDefined/{type_id} ({label}): {err}")
+        continue
+
+    folder_id = data.get("id") if isinstance(data, dict) else None
+    if not folder_id:
+        log.debug(f"      preDefined/{type_id} ({label}): no id in response")
+        continue
+    if folder_id in seen_ids:
+        log.debug(f"      preDefined/{type_id} ({label}): duplicate id {folder_id}, skipped")
+        continue
+
+    seen_ids.add(folder_id)
+    discovered.append({"id": folder_id, "label": label, "description": description})
+    log.info(f"      ✅ Root folder: {label}  (id: {folder_id})")
+
+if not discovered:
+    log.warning(f"    [WARN] No predefined root folders resolved for project {project_id}")
+return discovered
+```
+
+# =============================================================================
+
+# ★ PAGINATED FOLDER CONTENTS
+
+# Handles MSTR folders with hundreds of children by looping through pages.
+
+# Uses offset+limit until all items are retrieved.
+
+# =============================================================================
+
+def get_folder_children(
+base_url: str, token: str, project_id: str, folder_id: str
+) -> list:
+“””
+GET /api/folders/{id} with pagination.
+Retrieves ALL child items of type Folder (type=8) across all pages.
+Returns list of {“id”: …, “name”: …} dicts.
+Never raises — returns [] on any error.
+“””
+all_children = []
+offset       = 0
+
+```
+while True:
+    data, err = safe_get(
+        f"{base_url}/api/folders/{folder_id}",
+        token,
+        project_id=project_id,
+        params={"fields": "id,name,type", "limit": PAGE_LIMIT, "offset": offset},
+    )
+    if err:
+        log.warning(f"    [WARN] Folder contents fetch failed (id={folder_id}, offset={offset}): {err}")
+        break
+
+    # API returns either a list directly or a dict with a 'contents' key
+    if isinstance(data, list):
+        page_items = data
+    elif isinstance(data, dict):
+        page_items = data.get("contents", [])
+    else:
+        log.warning(f"    [WARN] Unexpected folder contents type for id={folder_id}: {type(data)}")
+        break
+
+    # Filter to folders only
+    folder_items = [
+        i for i in page_items
+        if isinstance(i, dict) and i.get("type") == FOLDER_TYPE
+    ]
+    all_children.extend(folder_items)
+
+    # If the page returned fewer items than PAGE_LIMIT, we're on the last page
+    if len(page_items) < PAGE_LIMIT:
+        break
+
+    offset += PAGE_LIMIT
+
+return all_children
+```
+
+# =============================================================================
+
+# ACL FETCHING AND PARSING
+
+# =============================================================================
+
+def fetch_folder_acl_raw(
+base_url: str, token: str, project_id: str, folder_id: str
+) -> list:
+“””
+GET /api/objects/{id}/acl?type=8
+Returns raw acl list or [] on any failure.
+“””
+data, err = safe_get(
+f”{base_url}/api/objects/{folder_id}/acl”,
+token,
+project_id=project_id,
+params={“type”: FOLDER_TYPE},
+)
+if err:
+log.warning(f”    [WARN] ACL fetch failed (folder_id={folder_id}): {err}”)
+return []
+return data.get(“acl”, []) if isinstance(data, dict) else []
+
+def parse_acl_entries(
+acl_raw: list, source_label: str, source_detail: str
+) -> list:
+“””
+Filter and decode raw ACL entries.
+Includes: user groups (8705) and individual users (8704).
+Excludes: all other trustee types.
+All numeric fields are decoded to human-readable descriptions.
+Never raises.
+“””
+if not isinstance(acl_raw, list):
+return []
+
+```
+entries = []
+for entry in acl_raw:
+    if not isinstance(entry, dict):
+        continue
+
+    trustee_subtype = entry.get("trusteeSubtype", 0)
+
+    try:
+        trustee_subtype = int(trustee_subtype)
+    except (TypeError, ValueError):
+        trustee_subtype = 0
+
+    if trustee_subtype not in INCLUDED_TRUSTEE_SUBTYPES:
+        continue   # skip system objects and unknown trustee types
+
+    trustee_type  = entry.get("trusteeType", 34)
+    rights        = entry.get("rights", 0)
+    ace_type      = entry.get("type", 1)
+    inheritable   = bool(entry.get("inheritable", False))
+    deny          = bool(entry.get("deny", False))
+    rights_info   = decode_rights(rights)
+
+    entries.append({
+        "group":                entry.get("trusteeName", "Unknown"),
+        "trustee_id":           entry.get("trusteeId", ""),
+        "trustee_type_int":     trustee_type,
+        "trustee_type_desc":    decode_trustee_type(trustee_type),
+        "trustee_subtype_int":  trustee_subtype,
+        "trustee_subtype_desc": decode_trustee_subtype(trustee_subtype),
+        "trustee_category":     trustee_category(trustee_subtype),
+        "ace_type_int":         ace_type,
+        "ace_type_desc":        decode_ace_type(ace_type),
+        "rights_int":           rights,
+        "permissions_list":     rights_info["permissions_list"],
+        "permissions_decoded":  rights_info["permissions_decoded"],
+        "combo_description":    rights_info["combo_description"],
+        "inheritable":          inheritable,
+        "inheritable_desc":     decode_inheritable(inheritable),
+        "deny":                 deny,
+        "acl_source":           source_label,
+        "acl_source_detail":    source_detail,
+    })
+return entries
+```
+
+def merge_effective_acl(direct: list, inherited: list) -> list:
+“””
+Merge direct + inherited ACL entries.
+Direct entries win on duplicate group names.
+Never raises.
+“””
+seen = {}
+for entry in (direct or []):
+if isinstance(entry, dict):
+seen[entry.get(“group”, “”)] = entry
+for entry in (inherited or []):
+if isinstance(entry, dict):
+key = entry.get(“group”, “”)
+if key not in seen:
+seen[key] = entry
+return list(seen.values())
+
+# =============================================================================
+
+# MARKDOWN CHUNK BUILDER  (AI-optimized, self-contained per folder)
+
+# =============================================================================
+
+def build_markdown_chunk(record: dict) -> str:
+“””
+Build a self-contained markdown document for one record.
+Designed so the LLM can answer any access question from a single chunk
+without needing to cross-reference other chunks.
+Never raises.
+“””
+try:
+env        = record.get(“environment”, “”)
+server     = record.get(“server”, “”)
+project    = record.get(“project”, “”)
+depth      = record.get(“depth”, 0)
+rec_type   = record.get(“record_type”, “folder_acl”)
+is_project = rec_type == “project_acl”
+
+```
+    depth_label = (
+        "PROJECT LEVEL — above all folders"
+        if depth == -1
+        else f"Level {depth}  (0 = root, {MAX_DEPTH} = deepest)"
+    )
+
+    lines = [
+        "# MSTR Access Control Record",
+        "",
+        "## Identity",
+        f"- **Record Type:** {'Project-Level ACL' if is_project else 'Folder ACL'}",
+        f"- **Environment:** {env}  |  **Server:** {server}",
+        f"- **Project:** {project}",
+        f"- **Object Name:** {record.get('folder_name', '')}",
+        f"- **Full Path:** {record.get('folder_path', '')}",
+        f"- **Object ID:** {record.get('folder_id', '')}",
+        f"- **Depth:** {depth_label}",
+        f"- **Generated:** {record.get('generated_at', '')}",
+        "",
+        "## Who Can Access (Effective — Direct + Inherited Combined)",
+        ("> Controls who can **connect to this project**."
+         if is_project
+         else f"> Who has access to `{record.get('folder_name', '')}` "
+              f"in `{project}` on `{env}` — complete picture."),
+        "",
+    ]
+
+    effective = record.get("effective_acl") or []
+    if not effective:
+        lines.append("_No trustee ACL entries found on this object._")
+    else:
+        for e in effective:
+            deny_tag  = " **[DENY]**" if e.get("deny") else ""
+            src_note  = f"[{e.get('acl_source_detail', '')}]"
+            cat       = e.get("trustee_category", "")
+            lines.append(
+                f"- **{e.get('group', '')}**{deny_tag}  ({cat})  →  "
+                f"{e.get('permissions_decoded', '')}  "
+                f"| _{e.get('combo_description', '')}_  {src_note}"
+            )
+
+    lines += ["", "## Direct Permissions (set explicitly on this object)", ""]
+    direct = record.get("direct_acl") or []
+    if not direct:
+        lines.append("_None — all access is inherited from parent objects._")
+    else:
+        for e in direct:
+            deny_tag = " **[DENY]**" if e.get("deny") else ""
+            inh_note = (
+                " _(propagates to children)_"
+                if e.get("inheritable")
+                else " _(this object only)_"
+            )
+            lines += [
+                f"- **{e.get('group', '')}**{deny_tag}  →  "
+                f"{e.get('permissions_decoded', '')}{inh_note}",
+                f"  - `rights_int={e.get('rights_int', 0)}` → "
+                f"{e.get('combo_description', '')}",
+                f"  - trusteeType={e.get('trustee_type_int', '')} "
+                f"({e.get('trustee_type_desc', '')}) | "
+                f"trusteeSubtype={e.get('trustee_subtype_int', '')} "
+                f"({e.get('trustee_subtype_desc', '')})",
+                f"  - ACE type={e.get('ace_type_int', '')} "
+                f"({e.get('ace_type_desc', '')})",
+            ]
+
+    lines += ["", "## Inherited Permissions (from parent folders)", ""]
+    inherited = record.get("inherited_acl") or []
+    if not inherited:
+        lines.append("_None — root-level object or no inheritance._")
+    else:
+        for e in inherited:
+            deny_tag = " **[DENY]**" if e.get("deny") else ""
+            lines.append(
+                f"- **{e.get('group', '')}**{deny_tag}  →  "
+                f"{e.get('permissions_decoded', '')}  "
+                f"| _{e.get('acl_source_detail', '')}_"
+            )
+
+    children = record.get("children") or []
+    if children:
+        lines += ["", "## Child Folders"]
+        for c in children:
+            lines.append(f"- {c}")
+
+    lines += ["", "---", ""]
+    return "\n".join(lines)
+
+except Exception as exc:
+    log.warning(f"    [WARN] build_markdown_chunk failed: {exc}")
+    return "# MSTR Access Control Record\n\n_Error generating chunk._\n\n---\n"
+```
+
+# =============================================================================
+
+# RECURSIVE FOLDER WALKER
+
+# =============================================================================
+
+def walk_folder(
+base_url: str,
+token: str,
+project_id: str,
+project_name: str,
+folder_id: str,
+folder_name: str,
+env: str,
+server: str,
+parent_path: str,
+parent_effective_acl: list,
+all_records: list,
+depth: int,
+max_depth: int,
+generated_at: str,
+) -> None:
+“””
+Recursively walk a folder tree collecting ACL records.
+- Fetches this folder’s direct ACL
+- Builds inherited ACL from parent’s effective ACL
+- Merges to produce effective ACL (direct wins)
+- Recurses into child folders if depth < max_depth
+- Pagination handled by get_folder_children()
+- All errors caught and logged — never raises
+“””
+try:
+folder_path = f”{parent_path} > {folder_name}” if parent_path else folder_name
+log.info(f”    {’  ’ * depth}📁 [depth {depth}] {folder_path}”)
+
+```
+    # ── Direct ACL for this folder ─────────────────────────────────────────
+    acl_raw    = fetch_folder_acl_raw(base_url, token, project_id, folder_id)
+    direct_acl = parse_acl_entries(
+        acl_raw,
+        source_label="direct",
+        source_detail="Assigned directly on this folder",
+    )
+
+    # ── Inherited ACL = parent effective re-labeled ────────────────────────
+    inherited_acl = []
+    for entry in (parent_effective_acl or []):
+        if not isinstance(entry, dict):
+            continue
+        inh = deepcopy(entry)
+        inh["acl_source"]        = "inherited"
+        inh["acl_source_detail"] = f"inherited_from: {parent_path or 'project root'}"
+        inherited_acl.append(inh)
+
+    # ── Effective = direct wins, fill from inherited ───────────────────────
+    effective_acl = merge_effective_acl(direct_acl, inherited_acl)
+
+    # ── Child folders (paginated) ──────────────────────────────────────────
+    child_folders = []
+    if depth < max_depth:
+        child_folders = get_folder_children(base_url, token, project_id, folder_id)
+
+    # ── Build record ───────────────────────────────────────────────────────
+    record = {
+        "environment":    env,
+        "server":         server,
+        "project":        project_name,
+        "project_id":     project_id,
+        "folder_name":    folder_name,
+        "folder_path":    folder_path,
+        "folder_id":      folder_id,
+        "depth":          depth,
+        "record_type":    "folder_acl",
+        "direct_acl":     direct_acl,
+        "inherited_acl":  inherited_acl,
+        "effective_acl":  effective_acl,
+        "children":       [c.get("name", "") for c in child_folders],
+        "generated_at":   generated_at,
+        "markdown_chunk": "",
+    }
+    record["markdown_chunk"] = build_markdown_chunk(record)
+    all_records.append(record)
+
+    # ── Recurse ────────────────────────────────────────────────────────────
+    for child in child_folders:
+        child_id   = child.get("id", "")
+        child_name = child.get("name", "")
+        if not child_id or not child_name:
+            continue
+        walk_folder(
+            base_url, token, project_id, project_name,
+            child_id, child_name,
+            env, server,
+            folder_path,
+            effective_acl,
+            all_records,
+            depth + 1, max_depth,
+            generated_at,
+        )
+
+except Exception as exc:
+    log.warning(
+        f"    [WARN] walk_folder failed at depth {depth} "
+        f"folder_id={folder_id} name='{folder_name}': {exc}"
+    )
+```
+
+# =============================================================================
+
+# EXPORT: STRUCTURED JSON (per environment, RAG-ready)
+
+# =============================================================================
+
+def export_json(
+env: str, server: str,
+acl_records: list, membership_records: list,
+generated_at: str,
+) -> None:
+“””
+Write structured JSON for one environment.
+Grouped by project. Markdown chunks excluded (they live in .md).
+Includes a top-level encoding_reference block.
+“””
+by_project: dict = {}
+
+```
+for r in acl_records:
+    pname = r.get("project", "Unknown")
+    if pname not in by_project:
+        by_project[pname] = {
+            "project_name":       pname,
+            "project_id":         r.get("project_id", ""),
+            "project_acl":        None,
+            "project_membership": [],
+            "folder_count":       0,
+            "folders":            [],
+        }
+    entry = {k: v for k, v in r.items() if k != "markdown_chunk"}
+    if r.get("record_type") == "project_acl":
+        by_project[pname]["project_acl"] = entry
+    else:
+        by_project[pname]["folders"].append(entry)
+        by_project[pname]["folder_count"] += 1
+
+for m in membership_records:
+    pname = m.get("project", "Unknown")
+    if pname in by_project:
+        by_project[pname]["project_membership"].append(m)
+
+output = {
+    "schema_version":    "3.0",
+    "environment":       env,
+    "server":            server,
+    "generated_at":      generated_at,
+    "max_depth_scanned": MAX_DEPTH,
+    "total_acl_records": len(acl_records),
+    "total_members":     len(membership_records),
+    "coverage": {
+        "project_membership": True,
+        "project_level_acl":  True,
+        "public_objects":     True,
+        "schema_objects":     True,
+        "all_root_folders":   True,
+        "pagination":         True,
+        "page_size":          PAGE_LIMIT,
+        "trustee_filter":     (
+            f"trusteeSubtype in {sorted(INCLUDED_TRUSTEE_SUBTYPES)} "
+            "— User Groups (AD/LDAP, 8705) AND Individual Users (8704)"
+        ),
+    },
+    "encoding_reference": {
+        "trustee_types":        TRUSTEE_TYPE_DESC,
+        "trustee_subtypes":     TRUSTEE_SUBTYPE_DESC,
+        "ace_types":            ACE_TYPE_DESC,
+        "rights_bits":          {str(k): v for k, v in RIGHTS_BITS.items()},
+        "common_rights_combos": {str(k): v for k, v in COMMON_RIGHTS_COMBOS.items()},
+    },
+    "projects": list(by_project.values()),
+}
+
+path = OUTPUT_DIR / f"{env.lower()}_context.json"
+try:
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(output, fh, indent=2)
+    log.info(f"  ✅ JSON → {path}")
+except Exception as exc:
+    log.error(f"  ❌ Failed writing JSON for {env}: {exc}")
+```
+
+# =============================================================================
+
+# EXPORT: AI-OPTIMIZED MARKDOWN (per environment)
+
+# =============================================================================
+
+def export_markdown(
+env: str, server: str,
+acl_records: list, membership_records: list,
+generated_at: str,
+) -> None:
+“””
+Write an AI-optimized markdown file for one environment.
+Structure:
+- Global preamble: audit metadata + full encoding reference
+- Project membership section per project
+- Folder ACL sections: Project ACL | Public Objects | Schema Objects | Other
+Each folder chunk is self-contained so the LLM never needs to cross-reference.
+“””
+lines = [
+f”# MSTR ACL Audit — {env} Environment”,
+“”,
+f”**Server:** {server}  |  **Generated:** {generated_at}”,
+f”**Max Depth:** {MAX_DEPTH}  |  **Page Size:** {PAGE_LIMIT}”,
+f”**ACL Records:** {len(acl_records)}  |  **Membership Records:** {len(membership_records)}”,
+f”**Trustee Coverage:** User Groups (AD/LDAP, subtype=8705) “
+f”AND Individual Users directly assigned (subtype=8704)”,
+“”,
+“—”,
+“”,
+“## Coverage Scope”,
+“”,
+“| Scope | Included | Notes |”,
+“|—––|–––––|—––|”,
+“| Project membership | ✅ Yes | Groups/users added via User Manager |”,
+“| Project-level ACL | ✅ Yes | Rights on the project object itself |”,
+“| Public Objects | ✅ Yes | Root + all subfolders |”,
+f”| App Folders (nested) | ✅ Yes | Custom app folders to depth {MAX_DEPTH} |”,
+“| Schema Objects | ✅ Yes | Root + Attributes, Facts, Hierarchies, Tables |”,
+“| Pagination | ✅ Yes | All folder children retrieved regardless of count |”,
+“| Personal (My Reports) | ❌ No | Personal user folders excluded by design |”,
+“”,
+“—”,
+“”,
+“## Global Encoding Reference”,
+“”,
+“### Rights Bitmask (EnumDSSXMLAccessRightFlags)”,
+“| Bit | Permission | Meaning |”,
+“|—–|————|———|”,
+“| 1   | Execute | Run reports and documents |”,
+“| 2   | Use / Web | Access via MicroStrategy Web |”,
+“| 4   | Browse | See the object in folder listings |”,
+“| 8   | Read | Open and view object contents |”,
+“| 16  | Write | Modify and save the object |”,
+“| 32  | Delete | Delete the object |”,
+“| 64  | Control | Modify this object’s own ACL |”,
+“| 128 | Admin Flag | Full administrative access |”,
+“”,
+“### Common Composite Rights”,
+“| rights_int | Decoded Meaning |”,
+“|————|—————–|”,
+]
+for val, label in COMMON_RIGHTS_COMBOS.items():
+lines.append(f”| {val} | {label} |”)
+
+```
+lines += [
+    "",
+    "### Trustee Subtypes (EnumDSSXMLObjectSubTypes)",
+    "| Int  | Hex    | Meaning |",
+    "|------|--------|---------|",
+    "| 8704 | 0x2200 | Individual User Account — directly assigned |",
+    "| 8705 | 0x2201 | User Group — AD / LDAP group |",
+    "",
+    "### ACE Type | Inheritable | Deny",
+    "| Field | Value | Meaning |",
+    "|-------|-------|---------|",
+    "| type | 1 | Standard ACE — grants or denies listed rights |",
+    "| inheritable | true | New objects in this folder auto-inherit this ACE |",
+    "| inheritable | false | Applies to this folder only |",
+    "| deny | false | Access GRANTED |",
+    "| deny | true | Access explicitly BLOCKED — overrides any grant |",
+    "",
+    "---",
+    "",
+    "# Records by Project",
+    "",
+]
+
+# Build membership lookup by project
+membership_by_project: dict = defaultdict(list)
+for m in membership_records:
+    membership_by_project[m.get("project", "")].append(m)
+
+# Build ACL lookup by project
+acl_by_project: dict = defaultdict(list)
+for r in acl_records:
+    acl_by_project[r.get("project", "")].append(r)
+
+all_projects = sorted(set(list(acl_by_project.keys()) + list(membership_by_project.keys())))
+
+for project_name in all_projects:
+    proj_acl_records = acl_by_project.get(project_name, [])
+    proj_members     = membership_by_project.get(project_name, [])
+
+    proj_acl   = [r for r in proj_acl_records if r.get("record_type") == "project_acl"]
+    folders    = [r for r in proj_acl_records if r.get("record_type") != "project_acl"]
+
+    public_folders = sorted(
+        [r for r in folders if "Public Objects" in r.get("folder_path", "")],
+        key=lambda x: x.get("depth", 0)
+    )
+    schema_folders = sorted(
+        [r for r in folders if "Schema Objects" in r.get("folder_path", "")],
+        key=lambda x: x.get("depth", 0)
+    )
+    other_folders  = sorted(
+        [r for r in folders
+         if "Public Objects" not in r.get("folder_path", "")
+         and "Schema Objects" not in r.get("folder_path", "")],
+        key=lambda x: x.get("depth", 0)
+    )
+
+    lines += [
+        f"## Project: {project_name}",
+        "",
+        "| Section | Count |",
+        "|---------|-------|",
+        f"| Project members (User Manager) | {len(proj_members)} |",
+        f"| Project-Level ACL entries | {len(proj_acl)} |",
+        f"| Public Objects folders | {len(public_folders)} |",
+        f"| Schema Objects folders | {len(schema_folders)} |",
+        f"| Other root folders | {len(other_folders)} |",
+        "",
+    ]
+
+    # ── Project membership section ─────────────────────────────────────────
+    if proj_members:
+        lines += [
+            "### 👥 Project Membership (User Manager)",
+            "_Everyone added to this project regardless of folder-level ACLs._",
+            "",
+            "| Member Name | Member Type | Category |",
+            "|-------------|-------------|----------|",
+        ]
+        for m in proj_members:
+            lines.append(
+                f"| {m.get('member_name', '')} | "
+                f"{m.get('member_type', '')} | "
+                f"{m.get('member_category', '')} |"
+            )
+        lines.append("")
+    else:
+        lines += [
+            "### 👥 Project Membership (User Manager)",
+            "_No members returned — endpoint may require elevated privileges._",
+            "",
+        ]
+
+    # ── Folder ACL sections ────────────────────────────────────────────────
+    if proj_acl:
+        lines += [
+            "### 🏢 Project-Level ACL",
+            "_Controls which principals have rights on the project object itself._",
+            "",
+        ]
+        for r in proj_acl:
+            lines.append(r.get("markdown_chunk", ""))
+
+    if public_folders:
+        lines += [
+            "### 📂 Public Objects Folder Tree",
+            "_User-facing content: reports, dashboards, metrics, filters, app folders._",
+            "",
+        ]
+        for r in public_folders:
+            lines.append(r.get("markdown_chunk", ""))
+
+    if schema_folders:
+        lines += [
+            "### 🗂️ Schema Objects Folder Tree",
+            "_Schema layer: attributes, facts, hierarchies, tables, transformations._",
+            "",
+        ]
+        for r in schema_folders:
+            lines.append(r.get("markdown_chunk", ""))
+
+    if other_folders:
+        lines += ["### 📁 Other Root Folders", ""]
+        for r in other_folders:
+            lines.append(r.get("markdown_chunk", ""))
+
+path = OUTPUT_DIR / f"{env.lower()}_ai_context.md"
+try:
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+    log.info(f"  ✅ MD   → {path}")
+except Exception as exc:
+    log.error(f"  ❌ Failed writing markdown for {env}: {exc}")
+```
+
+# =============================================================================
+
+# EXPORT: COMBINED ACL CSV (all environments)
+
+# =============================================================================
+
+def export_acl_csv(all_records: list) -> None:
+“””
+Flat CSV — one row per effective ACL entry across all environments.
+Every numeric field has a paired _desc column.
+“””
+path = OUTPUT_DIR / “all_environments_acl.csv”
+rows = []
+
+```
+for record in all_records:
+    section = get_tree_section(record)
+    for entry in (record.get("effective_acl") or []):
+        if not isinstance(entry, dict):
+            continue
+        rows.append({
+            "environment":          record.get("environment", ""),
+            "server":               record.get("server", ""),
+            "project":              record.get("project", ""),
+            "record_type":          record.get("record_type", "folder_acl"),
+            "folder_tree_section":  section,
+            "folder_depth":         record.get("depth", 0),
+            "folder_path":          record.get("folder_path", ""),
+            "folder_name":          record.get("folder_name", ""),
+            "folder_id":            record.get("folder_id", ""),
+            "trustee_name":         entry.get("group", ""),
+            "trustee_id":           entry.get("trustee_id", ""),
+            "trustee_type_int":     entry.get("trustee_type_int", 34),
+            "trustee_type_desc":    entry.get("trustee_type_desc", ""),
+            "trustee_subtype_int":  entry.get("trustee_subtype_int", ""),
+            "trustee_subtype_desc": entry.get("trustee_subtype_desc", ""),
+            "trustee_category":     entry.get("trustee_category", ""),
+            "ace_type_int":         entry.get("ace_type_int", 1),
+            "ace_type_desc":        entry.get("ace_type_desc", ""),
+            "rights_int":           entry.get("rights_int", 0),
+            "permissions_decoded":  entry.get("permissions_decoded", ""),
+            "combo_description":    entry.get("combo_description", ""),
+            "inheritable":          entry.get("inheritable", False),
+            "inheritable_desc":     entry.get("inheritable_desc", ""),
+            "deny":                 "Yes" if entry.get("deny") else "No",
+            "acl_source":           entry.get("acl_source", ""),
+            "acl_source_detail":    entry.get("acl_source_detail", ""),
+            "generated_at":         record.get("generated_at", ""),
+        })
+
+try:
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=CSV_ACL_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+    log.info(f"  ✅ ACL CSV → {path}  ({len(rows):,} rows)")
+except Exception as exc:
+    log.error(f"  ❌ Failed writing ACL CSV: {exc}")
+```
+
+# =============================================================================
+
+# EXPORT: PROJECT MEMBERSHIP CSV (all environments)
+
+# =============================================================================
+
+def export_membership_csv(all_membership: list) -> None:
+“””
+Flat CSV — one row per project member across all environments.
+Shows everyone added via User Manager regardless of folder ACLs.
+“””
+path = OUTPUT_DIR / “project_membership.csv”
+try:
+with open(path, “w”, newline=””, encoding=“utf-8”) as fh:
+writer = csv.DictWriter(fh, fieldnames=CSV_MEMBERSHIP_FIELDNAMES)
+writer.writeheader()
+writer.writerows(all_membership)
+log.info(f”  ✅ Membership CSV → {path}  ({len(all_membership):,} rows)”)
+except Exception as exc:
+log.error(f”  ❌ Failed writing membership CSV: {exc}”)
+
+# =============================================================================
+
+# MAIN ORCHESTRATOR
+
+# =============================================================================
+
+def main() -> None:
+all_env_acl_records:    list = []
+all_env_membership:     list = []
+run_start                    = datetime.now()
+generated_at                 = run_start.isoformat()
+
+```
+log.info("=" * 68)
+log.info("  MSTR ACL AUDIT v3.0 — Full Coverage Mode")
+log.info(f"  Environments : {[e['env'] for e in ENVIRONMENTS]}")
+log.info(f"  Login Mode   : {LOGIN_MODE}  (1=Standard 8=Windows 16=LDAP)")
+log.info(f"  Max Depth    : {MAX_DEPTH}")
+log.info(f"  Page Size    : {PAGE_LIMIT}")
+log.info(f"  SSL Verify   : {SSL_VERIFY}")
+log.info(f"  Output Dir   : {OUTPUT_DIR.resolve()}")
+log.info("=" * 68)
+
+for env_config in ENVIRONMENTS:
+    env      = env_config.get("env", "UNKNOWN")
+    base_url = env_config.get("base_url", "")
+    username = env_config.get("username", "")
+    password = env_config.get("password", "")
+
+    if not base_url:
+        log.error(f"  ❌ base_url is empty for env '{env}' — skipping")
+        continue
+
+    server = base_url.split("/")[2] if "//" in base_url else base_url
+
+    log.info(f"\n{'─' * 60}")
+    log.info(f"  ► {env}  ({server})")
+    log.info(f"{'─' * 60}")
+
+    token            = None
+    env_acl_records  = []
+    env_membership   = []
+
+    try:
+        # ── Login ──────────────────────────────────────────────────────────
+        log.info("  Logging in...")
+        token = login(base_url, username, password)
+        log.info("  ✅ Logged in")
+
+        # ── Get all projects ───────────────────────────────────────────────
+        projects = get_all_projects(base_url, token)
+        if not projects:
+            log.warning(f"  [WARN] No projects returned for {env} — check permissions")
+            continue
+        log.info(f"  Found {len(projects)} project(s)")
+
+        for proj in projects:
+            if not isinstance(proj, dict):
+                continue
+
+            proj_id   = proj.get("id", "").strip()
+            proj_name = proj.get("name", "Unknown").strip()
+
+            if not proj_id:
+                log.warning(f"  [WARN] Skipping project with no id: {proj}")
+                continue
+
+            log.info(f"\n  📂 {proj_name}  (id: {proj_id})")
+
+            # ── 1. Project membership ───────────────────────────────────────
+            log.info("    Fetching project membership...")
+            members = get_project_members(
+                base_url, token, proj_id, proj_name,
+                env, server, generated_at
+            )
+            env_membership.extend(members)
+            log.info(f"    Project membership: {len(members)} total entries")
+
+            # ── 2. Project-level ACL ────────────────────────────────────────
+            log.info("    Fetching project-level ACL...")
+            proj_acl = get_project_acl_record(
+                base_url, token, proj_id, proj_name,
+                env, server, generated_at
+            )
+            env_acl_records.append(proj_acl)
+            log.info(f"    Project ACL entries: {len(proj_acl.get('effective_acl', []))}")
+
+            # ── 3. Discover all root folders ────────────────────────────────
+            log.info("    Discovering root folders...")
+            root_folders = get_all_root_folders(base_url, token, proj_id)
+
+            if not root_folders:
+                log.warning(
+                    f"    [WARN] No root folders found for '{proj_name}' — "
+                    "skipping folder walk for this project"
+                )
+                continue
+
+            # ── 4. Walk each root folder recursively ────────────────────────
+            for root in root_folders:
+                root_id    = root.get("id", "")
+                root_label = root.get("label", "")
+                if not root_id:
+                    continue
+                log.info(f"    Walking: {root_label}")
+                walk_folder(
+                    base_url=base_url,
+                    token=token,
+                    project_id=proj_id,
+                    project_name=proj_name,
+                    folder_id=root_id,
+                    folder_name=root_label,
+                    env=env,
+                    server=server,
+                    parent_path="",
+                    parent_effective_acl=[],
+                    all_records=env_acl_records,
+                    depth=0,
+                    max_depth=MAX_DEPTH,
+                    generated_at=generated_at,
+                )
+
+        # ── Per-environment exports ────────────────────────────────────────
+        log.info(
+            f"\n  {env}: {len(env_acl_records):,} ACL records, "
+            f"{len(env_membership):,} membership records"
+        )
+        log.info("  Exporting...")
+        export_json(env, server, env_acl_records, env_membership, generated_at)
+        export_markdown(env, server, env_acl_records, env_membership, generated_at)
+
+        all_env_acl_records.extend(env_acl_records)
+        all_env_membership.extend(env_membership)
+
+    except ValueError as exc:
+        # Login failures raise ValueError with a clear message
+        log.error(f"  ❌ {env}: {exc}")
+    except Exception as exc:
+        log.error(f"  ❌ Unexpected error for {env}: {exc}", exc_info=True)
+    finally:
+        if token:
+            logout(base_url, token)
+            log.info(f"  Session closed for {env}")
+
+# ── Combined exports across all environments ───────────────────────────────
+log.info(f"\n{'─' * 60}")
+log.info("  Writing combined output files...")
+export_acl_csv(all_env_acl_records)
+export_membership_csv(all_env_membership)
+
+elapsed = (datetime.now() - run_start).total_seconds()
+log.info(f"\n{'=' * 68}")
+log.info("  AUDIT COMPLETE")
+log.info(f"  Total ACL records    : {len(all_env_acl_records):,}")
+log.info(f"  Total members        : {len(all_env_membership):,}")
+log.info(f"  Elapsed              : {elapsed:.1f}s")
+log.info(f"  Output dir           : {OUTPUT_DIR.resolve()}")
+log.info("=" * 68)
+```
+
+# =============================================================================
+
+# ENTRY POINT
+
+# =============================================================================
+
+if **name** == “**main**”:
+main()
