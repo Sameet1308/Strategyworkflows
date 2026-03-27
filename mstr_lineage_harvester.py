@@ -1,23 +1,39 @@
 #!/usr/bin/env python3
 """
 mstr_lineage_harvester.py
------------------------------------------------------------------------------
-MicroStrategy Full-Chain Data Lineage Harvester
-Version: 2.0.0
+Version: 3.0.0  -- Full rewrite with correct API endpoints
 
-Pipeline:
-  1. Discover all projects (with optional exclusion list)
-  2. Harvest each project into separate normalized DataFrames
-  3. Join chain -> single final lineage DataFrame (edge grain)
-  4. Publish as Intelligent Cube on target dev server
+CONFIRMED API ENDPOINTS (from official MSTR REST API docs):
+  Auth      : POST /api/auth/login
+  Projects  : GET  /api/projects
+  Search    : GET  /api/searches/results?type={t}&limit={n}&offset={n}
+  Report    : GET  /api/model/reports/{id}          -> grid.rows/columns[].units[]
+  Attribute : GET  /api/model/attributes/{id}?showExpressionAs=tokens
+                   -> forms[].expressions[].tables[].objectId  (NOT .id)
+                   -> forms[].expressions[].expression.tokens[].value
+  Metric    : GET  /api/model/metrics/{id}?showExpressionAs=tokens
+                   -> expression.text / expression.tokens[]
+  Fact      : GET  /api/model/facts/{id}?showExpressionAs=tokens
+                   -> expressions[].expression.tree.columnName
+                   -> expressions[].tables[].objectId
+  Table     : GET  /api/model/tables/{id}
+                   -> information.name
+                   -> physicalTable.columns[].name
+                   -> physicalTable.columns[].dataType.type  (nested obj)
+  Datasrc   : GET  /api/datasources
+  Dossier   : GET  /api/dossiers/{id}/definition     -> datasets[]
+  Document  : GET  /api/documents/{id}/definition    -> datasets[]
 
-Edge grain:
-  One row = one relationship in the lineage chain.
-  A cube with 10 attributes produces 10 Cube->Attribute edges.
-  Each attribute with 3 forms produces 3 Attribute->Form edges.
-  Each form tied to a table with 15 columns produces 15 Table->Column edges.
+MASTER OBJECTS TABLE:
+  df_objects -- one row per MSTR object (universal join backbone)
+  Columns: object_id | object_name | object_type | object_subtype |
+           project_id | owner | date_modified | folder_id | folder_name
 
------------------------------------------------------------------------------
+LINEAGE CHAIN:
+  Project -> Dossier/Document -> Report/Cube
+          -> Metric -> formula text (inline)
+          -> Attribute -> Form -> Table -> Column -> Datasource
+          -> Fact -> Column reference -> Table -> Datasource
 """
 
 import time
@@ -33,72 +49,60 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
 
-# -----------------------------------------------------------------------------
-# CONFIGURATION  -- replace the YOUR_* placeholders before running
-# -----------------------------------------------------------------------------
+# =============================================================================
+# CONFIGURATION  -- Replace YOUR_* placeholders before running
+# =============================================================================
 
-# SOURCE = PRODUCTION SERVER  (lineage metadata is harvested FROM here)
+# SOURCE = PRODUCTION  (harvest FROM here)
 SOURCE_BASE_URL = "https://YOUR_PROD_SERVER/MicroStrategyLibrarySTD"
 
-# -- Project scope -------------------------------------------------------------
-# Add one or more project IDs below to harvest only those projects.
-# Leave the list empty [] to automatically harvest ALL projects in the environment.
-#
-# Example -- test with one project first:
-#   RUN_ONLY_PROJECT_IDS = ["XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"]
-#
-# Example -- full run across everything:
-#   RUN_ONLY_PROJECT_IDS = []
+# Shared credentials (same for both servers)
+MSTR_USERNAME = "YOUR_USERNAME"
+MSTR_PASSWORD = "YOUR_PASSWORD"
+
+# Project scope:
+#   Add project GUIDs to harvest only those projects.
+#   Leave [] to harvest ALL projects automatically.
 RUN_ONLY_PROJECT_IDS = [
     # "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX",
 ]
 
-# Shared credentials -- same username and password work on both prod and dev.
-MSTR_USERNAME = "YOUR_USERNAME"
-MSTR_PASSWORD = "YOUR_PASSWORD"
-
-# TARGET = DEV SERVER  (lineage cube is created / updated HERE)
-# Script runs on dev; the cube lives in dev; prod is never written to.
+# TARGET = DEV  (publish cube HERE)
 TARGET_BASE_URL   = "https://YOUR_DEV_SERVER/MicroStrategyLibrarySTD"
-TARGET_PROJECT_ID = "YOUR_DEV_PROJECT_ID"   # GUID of the dev project
+TARGET_PROJECT_ID = "YOUR_DEV_PROJECT_ID"
+TARGET_FOLDER_ID  = ""   # "" = project root
 
-# Folder inside the dev project where the cube will be created.
-# Leave "" to publish to the project root.
-TARGET_FOLDER_ID  = ""
-
-# -- Cube name ------------------------------------------------------------------
-# The cube uses a FIXED name. On every run the script checks if this cube already
-# exists in the dev project:
-#   - Found  -> updates it in-place (Replace policy) -- no duplicates
-#   - Not found -> creates it fresh
-# Change this name if you want a different cube name in Workstation.
 CUBE_NAME  = "MSTR_Lineage_Harvest"
 TABLE_NAME = "LineageEdges"
 
-PAGE_SIZE         = 200
-REQUEST_DELAY     = 0.15
-SQL_MAX_CHARS     = 800
-EXPR_MAX_CHARS    = 600
+# Tuning
+PAGE_SIZE     = 200
+REQUEST_DELAY = 0.1
+SQL_MAX       = 100000   # no truncation -- full SQL captured regardless of length
+EXPR_MAX      = 100000   # no truncation -- full expression captured regardless of length
+CHUNK_SIZE    = 50000
 
-# -----------------------------------------------------------------------------
-# MSTR OBJECT TYPE CONSTANTS
-# -----------------------------------------------------------------------------
+# =============================================================================
+# MSTR OBJECT TYPE CONSTANTS  (EnumDSSObjectType)
+# =============================================================================
+TYPE_FILTER    = 1
 TYPE_REPORT    = 3
 TYPE_METRIC    = 4
+TYPE_FACT      = 13
 TYPE_ATTRIBUTE = 12
+TYPE_TABLE     = 53
 TYPE_CUBE      = 776
 TYPE_DOCUMENT  = 55
 
-# Report subtypes -- returned in the subtype field of the report definition
-SUBTYPE_REPORT_GRID        = 768   # standard grid report (schema-based)
-SUBTYPE_REPORT_GRAPH       = 769   # graph report (schema-based)
-SUBTYPE_REPORT_FREEFORM    = 772   # freeform SQL report -- lineage IS the SQL
-SUBTYPE_REPORT_CUBE        = 774   # OLAP / cube-sourced report -- lineage -> Cube object
-SUBTYPE_REPORT_TRANSACTION = 775   # transaction report (write-back)
+# Report subtypes
+SUBTYPE_GRID       = 768
+SUBTYPE_GRAPH      = 769
+SUBTYPE_FREEFORM   = 772
+SUBTYPE_CUBE_RPT   = 774
 
-# -----------------------------------------------------------------------------
-# LOGGING
-# -----------------------------------------------------------------------------
+# =============================================================================
+# LOGGING + PROGRESS
+# =============================================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -107,97 +111,61 @@ logging.basicConfig(
 log = logging.getLogger("lineage")
 
 
-# -----------------------------------------------------------------------------
-# PROGRESS TRACKER
-# -----------------------------------------------------------------------------
-
-class ProgressTracker:
-    """
-    Lightweight progress tracker. Prints a visible status bar to the console
-    so you can see exactly where the script is at all times.
-
-    Usage:
-        tracker = ProgressTracker(total_steps=5)
-        tracker.step("Discovering projects")
-        tracker.step("Harvesting reports")
-        tracker.done()
-    """
-
-    def __init__(self, total_steps: int = 0, label: str = ""):
-        self.total   = total_steps
-        self.current = 0
-        self.label   = label
-        self.start   = datetime.now()
-
-    def step(self, message: str, current: int = None, total: int = None):
-        if current is not None:
-            self.current = current
-        else:
-            self.current += 1
-        if total is not None:
-            self.total = total
-
-        elapsed = (datetime.now() - self.start).seconds
-        if self.total > 0:
-            pct   = int((self.current / self.total) * 100)
-            bar   = ("=" * (pct // 5)).ljust(20)
-            label = f"[{bar}] {pct:3d}%  step {self.current}/{self.total}"
-        else:
-            label = f"[step {self.current}]"
-
-        sep = "=" * 70
-        print(f"\n{sep}")
-        print(f"  {self.label + ' | ' if self.label else ''}{message}")
-        print(f"  {label}  |  elapsed: {elapsed}s")
-        print(sep)
-        log.info(f"[PROGRESS] {message}")
-
-    def item(self, message: str):
-        """Log a sub-item within a step -- visible but less prominent."""
-        log.info(f"  --> {message}")
-
-    def done(self, total_rows: int = 0):
-        elapsed = (datetime.now() - self.start).seconds
-        sep = "=" * 70
-        print(f"\n{sep}")
-        print(f"  COMPLETE{' | ' + self.label if self.label else ''}")
-        if total_rows:
-            print(f"  Total lineage edges: {total_rows:,}")
-        print(f"  Total elapsed      : {elapsed}s")
-        print(f"{sep}\n")
+def step(phase: str, msg: str):
+    print(f"\n  [{phase}] {msg}")
+    log.info(f"[{phase}] {msg}")
 
 
-def progress(phase: str, message: str):
-    """Simple one-liner progress log -- used outside tracker context."""
-    print(f"\n  [{phase}] {message}")
-    log.info(f"[{phase}] {message}")
-
-
-# -----------------------------------------------------------------------------
+# =============================================================================
 # HELPERS
-# -----------------------------------------------------------------------------
+# =============================================================================
+def safe(v) -> str:
+    return str(v).strip() if v is not None else ""
 
-def trunc(val, max_len: int) -> str:
-    s = str(val).strip() if val else ""
-    return s[:max_len] + "..." if len(s) > max_len else s
 
-def safe(val) -> str:
-    return str(val).strip() if val is not None else ""
+def extract_tables_from_sql(sql: str) -> list:
+    """
+    Parse a freeform SQL statement and return all table names referenced.
+    Handles FROM, JOIN variants. Returns deduplicated list in order of appearance.
+    Used to generate one lineage row per table for freeform reports and cubes.
+    """
+    import re
+    if not sql:
+        return []
+    sql_upper = re.sub(r"--[^\n]*", "", sql.upper())   # strip line comments
+    sql_upper = re.sub(r"/\*.*?\*/", "", sql_upper, flags=re.DOTALL)  # block comments
+    pattern = (r"(?:FROM|JOIN|INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN"
+               r"|FULL\s+JOIN|CROSS\s+JOIN|LEFT\s+OUTER\s+JOIN"
+               r"|RIGHT\s+OUTER\s+JOIN|FULL\s+OUTER\s+JOIN)\s+"
+               r"([A-Z0-9_#@\.]+)")
+    matches = re.findall(pattern, sql_upper)
+    # Filter out SQL keywords mistakenly caught
+    skip = {"WHERE","SELECT","ON","SET","WITH","AS","AND","OR","NOT",
+            "IN","NULL","CASE","WHEN","THEN","ELSE","END","GROUP","ORDER",
+            "HAVING","UNION","EXCEPT","INTERSECT","LATERAL","VALUES"}
+    tables = [m.split(".")[-1] for m in matches   # strip schema prefix e.g. dbo.FACT
+              if m not in skip and not m.startswith("(")]
+    return list(dict.fromkeys(tables))   # deduplicated, order preserved
 
-def tokens_to_str(token_list: list) -> str:
-    if not isinstance(token_list, list):
+
+def trunc(v, n: int) -> str:
+    s = str(v).strip() if v else ""
+    return s[:n] + "..." if len(s) > n else s
+
+
+def tokens_to_str(tokens: list) -> str:
+    if not isinstance(tokens, list):
         return ""
-    return "".join(t.get("value", "") for t in token_list if isinstance(t, dict))
+    return "".join(t.get("value", "") for t in tokens if isinstance(t, dict))
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # MSTR REST CLIENT
-# -----------------------------------------------------------------------------
-
+# =============================================================================
 class MSTRClient:
     """
-    Thin REST client. Base URL stops at /MicroStrategyLibrarySTD.
-    /api/ always appended in code. loginMode=1. verify=False.
+    Base URL stops at /MicroStrategyLibrarySTD.
+    /api/ appended in code. loginMode=1. verify=False everywhere.
     """
 
     def __init__(self, base_url: str, username: str, password: str):
@@ -206,11 +174,11 @@ class MSTRClient:
         self.username = username
         self.password = password
         self.token: Optional[str] = None
-        self._session = requests.Session()
-        self._session.verify = False
+        self._s = requests.Session()
+        self._s.verify = False
 
     def login(self):
-        r = self._session.post(
+        r = self._s.post(
             f"{self.api}/auth/login",
             json={"username": self.username, "password": self.password, "loginMode": 1},
             headers={"Content-Type": "application/json"},
@@ -223,18 +191,17 @@ class MSTRClient:
     def logout(self):
         if self.token:
             try:
-                self._session.post(f"{self.api}/auth/logout",
-                                   headers=self._h(), verify=False)
+                self._s.post(f"{self.api}/auth/logout",
+                             headers=self._h(), verify=False)
             except Exception:
                 pass
             self.token = None
+            log.info("[AUTH] Disconnected")
 
     def _h(self, pid: str = "") -> dict:
-        h = {
-            "X-MSTR-AuthToken": self.token,
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-        }
+        h = {"X-MSTR-AuthToken": self.token,
+             "Content-Type": "application/json",
+             "Accept": "application/json"}
         if pid:
             h["X-MSTR-ProjectID"] = pid
         return h
@@ -242,10 +209,10 @@ class MSTRClient:
     def _req(self, method: str, path: str, pid: str = "",
              params: dict = None, body: dict = None) -> dict:
         time.sleep(REQUEST_DELAY)
-        url = f"{self.api}{path}"
         try:
-            r = self._session.request(
-                method, url,
+            r = self._s.request(
+                method,
+                f"{self.api}{path}",
                 headers=self._h(pid),
                 params=params,
                 json=body,
@@ -253,12 +220,12 @@ class MSTRClient:
                 timeout=60
             )
             if r.status_code in (400, 403, 404, 500):
-                log.debug(f"[{r.status_code}] {method} {path}")
+                log.debug(f"  [{r.status_code}] {method} {path}")
                 return {}
             r.raise_for_status()
             return r.json() if r.text.strip() else {}
         except Exception as e:
-            log.warning(f"[ERR] {method} {path} -> {e}")
+            log.warning(f"  [ERR] {method} {path} -> {e}")
             return {}
 
     def get(self, path: str, pid: str = "", params: dict = None) -> dict:
@@ -271,10 +238,13 @@ class MSTRClient:
         return self._req("PUT", path, pid=pid, body=body)
 
     def search_all(self, obj_type: int, pid: str) -> list:
+        """Paginated search for all objects of given type in a project."""
         results, offset = [], 0
         while True:
             data  = self.get("/searches/results", pid=pid,
-                             params={"type": obj_type, "limit": PAGE_SIZE, "offset": offset})
+                             params={"type": obj_type,
+                                     "limit": PAGE_SIZE,
+                                     "offset": offset})
             items = data.get("result", [])
             results.extend(items)
             if len(items) < PAGE_SIZE:
@@ -288,200 +258,134 @@ class MSTRClient:
         return data if isinstance(data, list) else data.get("projects", [])
 
     def get_datasources(self) -> list:
-        data = self.get("/datasources")
-        return data.get("datasources", [])
+        return self.get("/datasources").get("datasources", [])
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # PHASE 1 -- PROJECT DISCOVERY
-# -----------------------------------------------------------------------------
-
-def discover_projects(client: MSTRClient, run_only_ids: list) -> pd.DataFrame:
-    progress("PHASE 1", "Discovering projects...")
-    all_projects = client.get_projects()
-
-    if run_only_ids:
-        progress("PHASE 1", f"Targeted run -- {len(run_only_ids)} project(s) specified")
-    else:
-        progress("PHASE 1", f"Full run -- harvesting all {len(all_projects)} project(s) found")
-
+# =============================================================================
+def discover_projects(client: MSTRClient,
+                      run_only: list) -> pd.DataFrame:
+    step("PHASE 1", "Discovering projects...")
     rows = []
-    for p in all_projects:
-        pid    = safe(p.get("id"))
-        name   = safe(p.get("name"))
-        status = safe(p.get("status", ""))
-
-        if run_only_ids and pid not in run_only_ids:
-            log.debug(f"  [SKIP] {name} ({pid})")
+    for p in client.get_projects():
+        pid  = safe(p.get("id"))
+        name = safe(p.get("name"))
+        if run_only and pid not in run_only:
             continue
-
-        rows.append({"project_id": pid, "project_name": name, "project_status": status})
+        rows.append({"project_id": pid,
+                     "project_name": name,
+                     "project_status": safe(p.get("status", ""))})
         log.info(f"  [QUEUED] {name} ({pid})")
 
-    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["project_id","project_name","project_status"])
-    progress("PHASE 1", f"{len(df)} project(s) queued for harvest")
+    df = pd.DataFrame(rows) if rows else pd.DataFrame(
+        columns=["project_id", "project_name", "project_status"])
+    step("PHASE 1", f"{len(df)} project(s) queued")
     return df
 
 
-# -----------------------------------------------------------------------------
-# PHASE 2 -- HARVEST INTO NORMALIZED DataFrames
-# -----------------------------------------------------------------------------
-
+# =============================================================================
+# PHASE 2 -- HARVEST ENGINE
+# =============================================================================
 class HarvestEngine:
     """
-    Harvests every project into typed, normalized DataFrames.
+    Builds the following normalized DataFrames:
 
-    DataFrames:
-      df_reports          -- one row per report
-      df_cubes            -- one row per cube (includes SQL preview)
-      df_documents        -- one row per document / dossier
-      df_metrics          -- one row per unique metric + formula
-      df_attributes       -- one row per unique attribute
-      df_attr_forms       -- one row per attribute-form-expression (the key grain expansion)
-      df_br_rpt_metric    -- bridge: report <-> metric
-      df_br_rpt_attr      -- bridge: report <-> attribute
-      df_br_cube_metric   -- bridge: cube <-> metric
-      df_br_cube_attr     -- bridge: cube <-> attribute
-      df_br_doc_ds        -- bridge: document <-> dataset
-      df_datasources      -- one row per DB instance / DSN
-      df_tables           -- one row per logical/physical table
-      df_columns          -- one row per column
+    df_objects       -- MASTER: one row per MSTR object (universal join key)
+    df_reports       -- reports with subtype and sql preview
+    df_cubes         -- cubes with sql preview
+    df_documents     -- dossiers and documents
+    df_metrics       -- metrics with formula text
+    df_attributes    -- attributes
+    df_attr_forms    -- attribute form expressions + table mapping
+    df_facts         -- facts with column + table mapping
+    df_br_rpt_metric -- bridge report <-> metric
+    df_br_rpt_attr   -- bridge report <-> attribute
+    df_br_cube_metric-- bridge cube <-> metric
+    df_br_cube_attr  -- bridge cube <-> attribute
+    df_br_doc_ds     -- bridge document <-> dataset (report or cube)
+    df_datasources   -- DB instances / DSN info
+    df_tables        -- logical tables
+    df_columns       -- physical columns per table
     """
 
     def __init__(self, client: MSTRClient):
         self.c = client
-        # Caches
-        self._metric_cache:    dict = {}
-        self._attribute_cache: dict = {}
-        self._table_cache:     dict = {}
-        # Accumulators
-        self._reports:        list = []
-        self._cubes:          list = []
-        self._documents:      list = []
-        self._metrics:        list = []
-        self._attributes:     list = []
-        self._attr_forms:     list = []
-        self._br_rpt_metric:  list = []
-        self._br_rpt_attr:    list = []
-        self._br_cube_metric: list = []
-        self._br_cube_attr:   list = []
-        self._br_doc_ds:          list = []
-        self._freeform_sqls:      list = []   # freeform SQL reports
-        self._cube_sourced_reports: list = [] # OLAP / cube-sourced reports
-        self._datasources:        list = []
-        self._tables:         list = []
-        self._columns:        list = []
 
-    # -- Metric ----------------------------------------------------------------
+        # -- caches
+        self._mcache: dict = {}
+        self._acache: dict = {}
+        self._tcache: dict = {}
+        self._fcache: dict = {}
 
-    def _fetch_metric(self, mid: str, pid: str) -> dict:
-        key = f"{pid}:{mid}"
-        if key not in self._metric_cache:
-            self._metric_cache[key] = self.c.get(f"/metrics/{mid}", pid=pid)
-        return self._metric_cache[key]
+        # -- accumulators
+        self._objects:     list = []
+        self._reports:     list = []
+        self._cubes:       list = []
+        self._documents:   list = []
+        self._metrics:     list = []
+        self._attributes:  list = []
+        self._attr_forms:  list = []
+        self._facts:       list = []
+        self._br_rm:       list = []   # report-metric bridge
+        self._br_ra:       list = []   # report-attribute bridge
+        self._br_cm:       list = []   # cube-metric bridge
+        self._br_ca:       list = []   # cube-attribute bridge
+        self._br_dd:       list = []   # document-dataset bridge
+        self._filters:     list = []   # filter objects
+        self._prompts:     list = []   # prompt objects
+        self._br_rf:       list = []   # report-filter bridge
+        self._br_cf:       list = []   # cube-filter bridge
+        self._br_rp:       list = []   # report-prompt bridge
+        self._br_cp:       list = []   # cube-prompt bridge
+        self._datasources: list = []
+        self._tables:      list = []
+        self._columns:     list = []
 
-    def _parse_formula(self, detail: dict) -> tuple:
-        expr = detail.get("expression", {})
-        if isinstance(expr, dict):
-            formula    = tokens_to_str(expr.get("tokens", []))
-            expression = safe(expr.get("text", ""))
-        else:
-            formula = expression = ""
-        if not formula:
-            expr2 = detail.get("definition", {}).get("expression", {})
-            if isinstance(expr2, dict):
-                formula = tokens_to_str(expr2.get("tokens", []))
-        return trunc(formula, EXPR_MAX_CHARS), trunc(expression, EXPR_MAX_CHARS)
-
-    def _register_metric(self, mid: str, mname: str, pid: str):
-        key = f"{pid}:{mid}"
-        if any(f"{r['project_id']}:{r['metric_id']}" == key for r in self._metrics):
+    # -------------------------------------------------------------------------
+    # Master objects table
+    # -------------------------------------------------------------------------
+    def _register_object(self, obj: dict, pid: str):
+        """Add any MSTR object to df_objects from a search result row."""
+        oid   = safe(obj.get("id"))
+        if not oid:
             return
-        detail = self._fetch_metric(mid, pid)
-        formula, expression = self._parse_formula(detail)
-        self._metrics.append({
-            "project_id":        pid,
-            "metric_id":         mid,
-            "metric_name":       mname or safe(detail.get("name","")),
-            "metric_formula":    formula,
-            "metric_expression": expression
+        # Avoid duplicates
+        if any(r["object_id"] == oid and r["project_id"] == pid
+               for r in self._objects):
+            return
+        owner = safe(obj.get("owner", {}).get("name", "")
+                     if isinstance(obj.get("owner"), dict) else obj.get("owner", ""))
+        self._objects.append({
+            "object_id":       oid,
+            "object_name":     safe(obj.get("name", "")),
+            "object_type":     safe(obj.get("type", "")),
+            "object_subtype":  safe(obj.get("subtype", "")),
+            "project_id":      pid,
+            "owner":           owner,
+            "date_modified":   safe(obj.get("modificationTime",
+                                   obj.get("dateModified", ""))),
+            "folder_id":       safe(obj.get("ancestors", [{}])[-1].get("objectId", "")
+                                    if obj.get("ancestors") else ""),
+            "folder_name":     safe(obj.get("ancestors", [{}])[-1].get("name", "")
+                                    if obj.get("ancestors") else ""),
         })
 
-    # -- Attribute -------------------------------------------------------------
+    def harvest_objects(self, pid: str, pname: str):
+        """
+        Build the master objects table for a project.
+        Searches all object types we care about.
+        """
+        log.info(f"  [OBJECTS] {pname}...")
+        for otype in [TYPE_REPORT, TYPE_CUBE, TYPE_DOCUMENT,
+                      TYPE_METRIC, TYPE_ATTRIBUTE, TYPE_FACT,
+                      TYPE_TABLE, TYPE_FILTER]:
+            for obj in self.c.search_all(otype, pid):
+                self._register_object(obj, pid)
 
-    def _fetch_attribute(self, aid: str, pid: str) -> dict:
-        key = f"{pid}:{aid}"
-        if key not in self._attribute_cache:
-            self._attribute_cache[key] = self.c.get(f"/attributes/{aid}", pid=pid)
-        return self._attribute_cache[key]
-
-    def _register_attribute(self, aid: str, aname: str, pid: str):
-        key = f"{pid}:{aid}"
-        if any(f"{r['project_id']}:{r['attribute_id']}" == key for r in self._attributes):
-            return
-
-        detail = self._fetch_attribute(aid, pid)
-        aname  = aname or safe(detail.get("name",""))
-        self._attributes.append({"project_id": pid, "attribute_id": aid, "attribute_name": aname})
-
-        # Each form -> each expression -> table -> register columns
-        for form in detail.get("forms", []):
-            form_name = safe(form.get("name",""))
-            for expr in form.get("expressions", []):
-                expr_obj = expr.get("expression", {})
-                if isinstance(expr_obj, dict):
-                    expr_str = tokens_to_str(expr_obj.get("tokens",[])) or safe(expr_obj.get("text",""))
-                else:
-                    expr_str = safe(expr_obj)
-
-                tbl_info = expr.get("table", {})
-                tbl_id   = safe(tbl_info.get("id",""))
-                tbl_name = safe(tbl_info.get("name",""))
-
-                self._attr_forms.append({
-                    "project_id":      pid,
-                    "attribute_id":    aid,
-                    "attribute_name":  aname,
-                    "form_name":       form_name,
-                    "form_expression": trunc(expr_str, EXPR_MAX_CHARS),
-                    "table_id":        tbl_id,
-                    "table_name":      tbl_name
-                })
-                if tbl_id:
-                    self._register_table(tbl_id, tbl_name, pid)
-
-        # Also register tables listed at attribute level
-        for tbl in detail.get("tables", []):
-            tid = safe(tbl.get("id",""))
-            if tid:
-                self._register_table(tid, safe(tbl.get("name","")), pid)
-
-    # -- Table / Column --------------------------------------------------------
-
-    def _register_table(self, tbl_id: str, tbl_name: str, pid: str, ds_id: str = ""):
-        key = f"{pid}:{tbl_id}"
-        if any(f"{r['project_id']}:{r['table_id']}" == key for r in self._tables):
-            return
-        detail  = self.c.get(f"/tables/{tbl_id}", pid=pid)
-        ds_id   = ds_id or safe(detail.get("dataSource",{}).get("id",""))
-        columns = detail.get("physicalTable",{}).get("columns",[])
-        self._tables.append({
-            "project_id":    pid,
-            "table_id":      tbl_id,
-            "table_name":    tbl_name or safe(detail.get("name","")),
-            "datasource_id": ds_id
-        })
-        for col in columns:
-            self._columns.append({
-                "project_id":       pid,
-                "table_id":         tbl_id,
-                "table_name":       tbl_name,
-                "column_name":      safe(col.get("columnName", col.get("name",""))),
-                "column_data_type": safe(col.get("dataType",""))
-            })
-
-    # -- Datasources -----------------------------------------------------------
-
+    # -------------------------------------------------------------------------
+    # Datasources
+    # -------------------------------------------------------------------------
     def harvest_datasources(self):
         log.info("  [DATASOURCES] Loading...")
         seen = set()
@@ -490,278 +394,589 @@ class HarvestEngine:
             if did in seen:
                 continue
             seen.add(did)
-            conn = ds.get("datasourceConnection",{})
+            conn = ds.get("datasourceConnection", {}) or {}
             self._datasources.append({
                 "datasource_id":    did,
-                "db_instance_name": safe(ds.get("name","")),
-                "dsn_name":         safe(conn.get("name","")),
-                "db_type":          safe(ds.get("dbType",""))
+                "db_instance_name": safe(ds.get("name", "")),
+                "dsn_name":         safe(conn.get("name", "")),
+                "db_type":          safe(ds.get("dbType", "")),
             })
         log.info(f"    -> {len(self._datasources)} datasources")
 
-    # -- Reports ---------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Table + Column  (GET /api/model/tables/{id})
+    # Response: information.name | physicalTable.columns[].name + .dataType.type
+    # -------------------------------------------------------------------------
+    def _register_table(self, tbl_id: str, tbl_name: str, pid: str):
+        key = f"{pid}:{tbl_id}"
+        if any(f"{r['project_id']}:{r['table_id']}" == key for r in self._tables):
+            return
 
-    def _get_report_sql(self, rid: str, pid: str) -> str:
-        """Fetch SQL preview for a report (freeform or standard)."""
-        sql_data = self.c.get(f"/reports/{rid}/sqlView", pid=pid)
-        if sql_data:
-            passes = sql_data.get("sqlStatements", [])
-            return " | ".join(p.get("sql", "") for p in passes if isinstance(p, dict))
-        return ""
+        detail   = self.c.get(f"/model/tables/{tbl_id}", pid=pid)
+        tbl_name = tbl_name or safe(
+            detail.get("information", {}).get("name", ""))
+        ds_id    = safe(detail.get("physicalTable", {})
+                        .get("information", {})
+                        .get("dataSourceId", ""))
+        if not ds_id:
+            ds_id = safe(detail.get("dataSource", {}).get("id", ""))
+
+        self._tables.append({
+            "project_id":    pid,
+            "table_id":      tbl_id,
+            "table_name":    tbl_name,
+            "datasource_id": ds_id,
+        })
+
+        # physicalTable.columns[].name + .dataType.type (nested obj)
+        for col in detail.get("physicalTable", {}).get("columns", []):
+            col_name = safe(col.get("name", ""))
+            dtype    = col.get("dataType", {})
+            col_type = safe(dtype.get("type", "") if isinstance(dtype, dict) else dtype)
+            if col_name:
+                self._columns.append({
+                    "project_id":       pid,
+                    "table_id":         tbl_id,
+                    "table_name":       tbl_name,
+                    "column_name":      col_name,
+                    "column_data_type": col_type,
+                })
+
+    # -------------------------------------------------------------------------
+    # Attribute  (GET /api/model/attributes/{id}?showExpressionAs=tokens)
+    # Confirmed response structure:
+    #   forms[].name
+    #   forms[].expressions[].expression.tokens[].value   -> column name
+    #   forms[].expressions[].tables[].objectId           -> table GUID (NOT .id)
+    #   forms[].expressions[].tables[].name               -> table name
+    # -------------------------------------------------------------------------
+    def _register_attribute(self, aid: str, aname: str, pid: str):
+        key = f"{pid}:{aid}"
+        if any(f"{r['project_id']}:{r['attribute_id']}" == key
+               for r in self._attributes):
+            return
+
+        if key not in self._acache:
+            self._acache[key] = self.c.get(
+                f"/model/attributes/{aid}", pid=pid,
+                params={"showExpressionAs": "tokens"})
+        detail = self._acache[key] or {}
+
+        aname = aname or safe(detail.get("information", {}).get("name", ""))
+        self._attributes.append({
+            "project_id":    pid,
+            "attribute_id":  aid,
+            "attribute_name": aname,
+        })
+
+        for form in detail.get("forms", []):
+            form_name = safe(form.get("name", ""))
+            for expr in form.get("expressions", []):
+                # Column expression from tokens
+                expr_obj = expr.get("expression", {})
+                expr_str = tokens_to_str(expr_obj.get("tokens", []))
+                if not expr_str:
+                    expr_str = safe(expr_obj.get("text", ""))
+
+                # tables[].objectId  (confirmed field name from MSTR docs)
+                for tbl_info in expr.get("tables", []):
+                    tbl_id   = safe(tbl_info.get("objectId", ""))
+                    tbl_name = safe(tbl_info.get("name", ""))
+
+                    self._attr_forms.append({
+                        "project_id":      pid,
+                        "attribute_id":    aid,
+                        "attribute_name":  aname,
+                        "form_name":       form_name,
+                        "form_expression": expr_str,
+                        "table_id":        tbl_id,
+                        "table_name":      tbl_name,
+                    })
+                    if tbl_id:
+                        self._register_table(tbl_id, tbl_name, pid)
+
+    # -------------------------------------------------------------------------
+    # Metric  (GET /api/model/metrics/{id}?showExpressionAs=tokens)
+    # Confirmed response: expression.text | expression.tokens[]
+    # -------------------------------------------------------------------------
+    def _register_metric(self, mid: str, mname: str, pid: str):
+        key = f"{pid}:{mid}"
+        if any(f"{r['project_id']}:{r['metric_id']}" == key
+               for r in self._metrics):
+            return
+
+        if key not in self._mcache:
+            self._mcache[key] = self.c.get(
+                f"/model/metrics/{mid}", pid=pid,
+                params={"showExpressionAs": "tokens"})
+        detail = self._mcache[key] or {}
+
+        mname   = mname or safe(detail.get("information", {}).get("name", ""))
+        expr    = detail.get("expression", {}) or {}
+        formula = tokens_to_str(expr.get("tokens", []))
+        if not formula:
+            formula = safe(expr.get("text", ""))
+
+        self._metrics.append({
+            "project_id":        pid,
+            "metric_id":         mid,
+            "metric_name":       mname,
+            "metric_formula":    formula,
+        })
+
+    # -------------------------------------------------------------------------
+    # Fact  (GET /api/model/facts/{id}?showExpressionAs=tokens)
+    # Confirmed response:
+    #   information.objectId, information.name
+    #   expressions[].expression.tree.columnName -> physical column
+    #   expressions[].tables[].objectId          -> table GUID
+    #   expressions[].tables[].name              -> table name
+    # -------------------------------------------------------------------------
+    def _register_fact(self, fid: str, fname: str, pid: str):
+        key = f"{pid}:{fid}"
+        if any(f"{r['project_id']}:{r['fact_id']}" == key
+               for r in self._facts):
+            return
+
+        if key not in self._fcache:
+            self._fcache[key] = self.c.get(
+                f"/model/facts/{fid}", pid=pid,
+                params={"showExpressionAs": "tokens"})
+        detail = self._fcache[key] or {}
+
+        fname = fname or safe(detail.get("information", {}).get("name", ""))
+
+        for expr in detail.get("expressions", []):
+            tree       = expr.get("expression", {}).get("tree", {})
+            col_name   = safe(tree.get("columnName", ""))
+
+            for tbl_info in expr.get("tables", []):
+                tbl_id   = safe(tbl_info.get("objectId", ""))
+                tbl_name = safe(tbl_info.get("name", ""))
+
+                self._facts.append({
+                    "project_id":  pid,
+                    "fact_id":     fid,
+                    "fact_name":   fname,
+                    "column_name": col_name,
+                    "table_id":    tbl_id,
+                    "table_name":  tbl_name,
+                })
+                if tbl_id:
+                    self._register_table(tbl_id, tbl_name, pid)
+
+    # -------------------------------------------------------------------------
+    # Filter  (GET /api/model/filters/{id}?showFilterTokens=true&showExpressionAs=tokens)
+    # Confirmed response: qualification.text  (human-readable filter expression)
+    # -------------------------------------------------------------------------
+    def _register_filter(self, fid: str, fname: str, pid: str) -> str:
+        """Register a filter and return its expression text."""
+        key = f"{pid}:{fid}"
+        if any(f"{r['project_id']}:{r['filter_id']}" == key for r in self._filters):
+            # Already registered -- return cached expression
+            cached = [r for r in self._filters if f"{r['project_id']}:{r['filter_id']}" == key]
+            return cached[0].get("filter_expression", "") if cached else ""
+
+        detail = self.c.get(
+            f"/model/filters/{fid}", pid=pid,
+            params={"showFilterTokens": "true", "showExpressionAs": "tokens"})
+        fname = fname or safe(detail.get("information", {}).get("name", ""))
+
+        # qualification.text is the human-readable filter expression
+        qual     = detail.get("qualification", {}) or {}
+        expr_txt = safe(qual.get("text", ""))
+        if not expr_txt:
+            # Fallback: build from tokens
+            expr_txt = tokens_to_str(qual.get("tokens", []))
+
+        self._filters.append({
+            "project_id":        pid,
+            "filter_id":         fid,
+            "filter_name":       fname,
+            "filter_expression": expr_txt,
+        })
+        return expr_txt
+
+    # -------------------------------------------------------------------------
+    # Prompt  (GET /api/model/prompts/{id})
+    # Also pulled inline from /api/reports/{id}/prompts
+    # -------------------------------------------------------------------------
+    def _register_prompt(self, prid: str, prname: str, prtype: str, pid: str):
+        key = f"{pid}:{prid}"
+        if any(f"{r['project_id']}:{r['prompt_id']}" == key for r in self._prompts):
+            return
+        # Try to get full definition
+        detail = self.c.get(f"/model/prompts/{prid}", pid=pid) or {}
+        prname = prname or safe(detail.get("information", {}).get("name", ""))
+        prtype = prtype or safe(detail.get("information", {}).get("subType", ""))
+        self._prompts.append({
+            "project_id":  pid,
+            "prompt_id":   prid,
+            "prompt_name": prname,
+            "prompt_type": prtype,
+        })
+
+    # -------------------------------------------------------------------------
+    # Reports  (GET /api/model/reports/{id})
+    # Confirmed structure:
+    #   grid.rows[]/columns[]: list of sections
+    #   Each section has units[] or is itself a unit: {id, name, type}
+    #   type "attribute" or "metrics"
+    # -------------------------------------------------------------------------
+    def _extract_units(self, detail: dict) -> tuple:
+        """Return (metrics_list, attrs_list) from /model/reports response."""
+        grid  = detail.get("grid", {})
+        avail = detail.get("availableObjects", {})
+
+        units = []
+        for section in grid.get("rows", []) + grid.get("columns", []):
+            for u in section.get("units", []):
+                units.append(u)
+            if "type" in section and "id" in section:
+                units.append(section)
+
+        metrics = avail.get("metrics", []) + \
+                  [u for u in units if u.get("type") in ("metric", "metrics")]
+        attrs   = avail.get("attributes", []) + \
+                  [u for u in units if u.get("type") == "attribute"]
+
+        # Deduplicate by id
+        def dedup(lst):
+            seen, out = set(), []
+            for x in lst:
+                oid = safe(x.get("id"))
+                if oid and oid not in seen:
+                    seen.add(oid)
+                    out.append(x)
+            return out
+
+        return dedup(metrics), dedup(attrs)
 
     def harvest_reports(self, pid: str, pname: str):
-        """
-        Handles three report types by subtype:
-          SUBTYPE_REPORT_GRID / GRAPH  -> schema-based: harvest metrics, attributes, tables, columns
-          SUBTYPE_REPORT_FREEFORM      -> no schema objects: capture raw SQL as lineage
-          SUBTYPE_REPORT_CUBE          -> sourced from a cube: edge Report->Cube, no table traversal
-        """
         log.info(f"  [REPORTS] {pname}...")
         for obj in self.c.search_all(TYPE_REPORT, pid):
             rid     = safe(obj.get("id"))
             rname   = safe(obj.get("name"))
-            subtype = int(obj.get("subtype", SUBTYPE_REPORT_GRID) or SUBTYPE_REPORT_GRID)
+            subtype = int(obj.get("subtype", SUBTYPE_GRID) or SUBTYPE_GRID)
 
             self._reports.append({
-                "project_id":    pid,
-                "report_id":     rid,
-                "report_name":   rname,
-                "report_subtype": str(subtype)
+                "project_id":     pid,
+                "report_id":      rid,
+                "report_name":    rname,
+                "report_subtype": str(subtype),
+                "sql_preview":    "",
             })
 
-            detail = self.c.get(f"/reports/{rid}", pid=pid)
-            defn   = detail.get("definition", {})
-
-            # -- FREEFORM SQL report -------------------------------------------
-            # No schema objects -- the SQL IS the full lineage.
-            # Captured as a single FreeformSQL node; attribute/metric traversal skipped.
-            if subtype == SUBTYPE_REPORT_FREEFORM:
-                sql_text = self._get_report_sql(rid, pid)
-                if not sql_text:
-                    # Also try pulling from definition directly
-                    sql_text = safe(defn.get("freeFormSQL", {}).get("sql", ""))
-                self._freeform_sqls.append({
-                    "project_id":  pid,
-                    "report_id":   rid,
-                    "report_name": rname,
-                    "freeform_sql": trunc(sql_text, SQL_MAX_CHARS)
-                })
-                log.debug(f"    [FREEFORM] {rname}")
+            # Freeform SQL -- capture SQL, skip schema traversal
+            if subtype == SUBTYPE_FREEFORM:
+                sql_data = self.c.get(f"/reports/{rid}/sqlView", pid=pid)
+                sql_text = ""
+                if sql_data:
+                    passes = sql_data.get("sqlStatements", [])
+                    sql_text = " | ".join(
+                        p.get("sql", "") for p in passes
+                        if isinstance(p, dict))
+                self._reports[-1]["sql_preview"] = sql_text
                 continue
 
-            # -- CUBE-SOURCED report (OLAP Services) ---------------------------
-            # Report queries an Intelligent Cube, not the DB directly.
-            # Lineage edge: Report -> Cube (cube lineage handles the rest).
-            if subtype == SUBTYPE_REPORT_CUBE:
-                dataset = defn.get("dataPartition", {}) or defn.get("dataset", {})
-                cube_id   = safe(dataset.get("id", ""))
-                cube_name = safe(dataset.get("name", ""))
-                # Fallback: check availableObjects for a cube reference
-                if not cube_id:
-                    for ds in defn.get("availableObjects", {}).get("datasets", []):
-                        if int(ds.get("type", 0)) == TYPE_CUBE:
-                            cube_id   = safe(ds.get("id", ""))
-                            cube_name = safe(ds.get("name", ""))
-                            break
-                self._cube_sourced_reports.append({
-                    "project_id":  pid,
-                    "report_id":   rid,
-                    "report_name": rname,
-                    "source_cube_id":   cube_id,
-                    "source_cube_name": cube_name
-                })
-                log.debug(f"    [CUBE-SOURCED] {rname} -> cube {cube_name}")
+            # GET /api/model/reports/{id}
+            detail = self.c.get(f"/model/reports/{rid}", pid=pid)
+            if not detail:
                 continue
 
-            # -- STANDARD GRID / GRAPH report ---------------------------------
-            # Schema-based: harvest metrics and attributes normally.
-            avail = defn.get("availableObjects", {})
-            grid  = defn.get("grid", {})
+            # Cube-sourced report -- just record the source cube
+            if subtype == SUBTYPE_CUBE_RPT:
+                ds = (detail.get("dataSource", {}) or
+                      detail.get("dataPartition", {}))
+                src_cube_id   = safe(ds.get("objectId", ds.get("id", "")))
+                src_cube_name = safe(ds.get("name", ""))
+                self._reports[-1]["source_cube_id"]   = src_cube_id
+                self._reports[-1]["source_cube_name"] = src_cube_name
+                continue
 
-            metrics = (avail.get("metrics", []) or
-                       [o for o in grid.get("columns", []) + grid.get("rows", [])
-                        if o.get("type") == "metric"])
+            # Standard grid/graph report
+            metrics, attrs = self._extract_units(detail)
             for m in metrics:
                 mid = safe(m.get("id"))
                 if not mid:
                     continue
-                self._br_rpt_metric.append({"project_id": pid, "report_id": rid, "metric_id": mid})
+                self._br_rm.append({"project_id": pid,
+                                    "report_id": rid, "metric_id": mid})
                 self._register_metric(mid, safe(m.get("name", "")), pid)
 
-            attrs = (avail.get("attributes", []) or
-                     [o for o in grid.get("columns", []) + grid.get("rows", [])
-                      if o.get("type") == "attribute"])
             for a in attrs:
                 aid = safe(a.get("id"))
                 if not aid:
                     continue
-                self._br_rpt_attr.append({"project_id": pid, "report_id": rid, "attribute_id": aid})
+                self._br_ra.append({"project_id": pid,
+                                    "report_id": rid, "attribute_id": aid})
                 self._register_attribute(aid, safe(a.get("name", "")), pid)
 
-    # -- Cubes -----------------------------------------------------------------
+            # Report filter  -- in /model/reports response under "filter"
+            # qualification.text gives the full human-readable filter expression
+            rpt_filter = detail.get("filter", {}) or {}
+            fid_inline  = safe(rpt_filter.get("objectId", rpt_filter.get("id", "")))
+            if fid_inline:
+                self._register_filter(fid_inline,
+                                      safe(rpt_filter.get("name", "")), pid)
+                self._br_rf.append({"project_id": pid,
+                                    "report_id": rid, "filter_id": fid_inline})
+            else:
+                # Inline filter expression (no separate filter object)
+                qual = rpt_filter.get("qualification", {}) or {}
+                expr = safe(qual.get("text", ""))
+                if expr:
+                    synthetic_id = f"inline_{rid}"
+                    self._filters.append({
+                        "project_id":        pid,
+                        "filter_id":         synthetic_id,
+                        "filter_name":       f"{rname} [Report Filter]",
+                        "filter_expression": expr,
+                    })
+                    self._br_rf.append({"project_id": pid,
+                                        "report_id": rid,
+                                        "filter_id": synthetic_id})
 
+            # Prompts  -- GET /api/reports/{id}/prompts
+            prompts_resp = self.c.get(f"/reports/{rid}/prompts", pid=pid)
+            for pr in (prompts_resp if isinstance(prompts_resp, list) else []):
+                prid   = safe(pr.get("id", pr.get("key", "")))
+                prname = safe(pr.get("name", ""))
+                prtype = safe(pr.get("type", pr.get("promptType", "")))
+                if prid:
+                    self._register_prompt(prid, prname, prtype, pid)
+                    self._br_rp.append({"project_id": pid,
+                                        "report_id": rid, "prompt_id": prid})
+
+    # -------------------------------------------------------------------------
+    # Cubes  (GET /api/model/reports/{id} -- same endpoint works for cubes)
+    # -------------------------------------------------------------------------
     def harvest_cubes(self, pid: str, pname: str):
         log.info(f"  [CUBES] {pname}...")
         for obj in self.c.search_all(TYPE_CUBE, pid):
             cid   = safe(obj.get("id"))
             cname = safe(obj.get("name"))
 
-            # SQL preview
+            # SQL preview via data API
             sql_data = self.c.get(f"/cubes/{cid}/sqlView", pid=pid)
             sql_text = ""
             if sql_data:
-                passes   = sql_data.get("sqlStatements",[])
-                sql_text = " | ".join(p.get("sql","") for p in passes if isinstance(p,dict))
+                passes   = sql_data.get("sqlStatements", [])
+                sql_text = " | ".join(
+                    p.get("sql", "") for p in passes if isinstance(p, dict))
 
             self._cubes.append({
-                "project_id":       pid,
-                "cube_id":          cid,
-                "cube_name":        cname,
-                "cube_sql_preview": trunc(sql_text, SQL_MAX_CHARS)
+                "project_id":      pid,
+                "cube_id":         cid,
+                "cube_name":       cname,
+                "sql_preview":     sql_text,
+                "cube_source_type": "",   # filled in below from /model/reports
             })
 
-            detail = self.c.get(f"/v2/cubes/{cid}", pid=pid) or self.c.get(f"/cubes/{cid}", pid=pid)
+            # Schema definition via /model/reports (same endpoint for cubes)
+            # sourceType field tells us whether this is schema-based or freeform SQL:
+            #   "normal"               -> schema-based: traverse metrics, attributes
+            #   "custom_sql_free_form" -> freeform SQL cube: SQL IS the lineage
+            detail = self.c.get(f"/model/reports/{cid}", pid=pid)
             if not detail:
                 continue
 
-            avail = detail.get("definition",{}).get("availableObjects",{})
+            source_type = safe(detail.get("sourceType", "normal"))
+            self._cubes[-1]["cube_source_type"] = source_type
 
-            for m in avail.get("metrics",[]):
+            # Harvest filter + prompts regardless of cube type
+            self._harvest_cube_filter_prompt(cid, cname, pid, detail)
+
+            if source_type == "custom_sql_free_form":
+                # Freeform SQL cube -- SQL already captured above via sqlView.
+                # Also try to get SQL directly from definition if sqlView was empty.
+                if not self._cubes[-1]["sql_preview"]:
+                    data_src = detail.get("dataSource", {}) or {}
+                    tbl      = data_src.get("table", {}) or {}
+                    phys     = tbl.get("physicalTable", {}) or {}
+                    sql_expr = phys.get("sqlExpression", {}) or {}
+                    sql_tree = sql_expr.get("tree", {}) or {}
+                    sql_val  = ""
+                    for child in sql_tree.get("children", []):
+                        sql_val += safe(child.get("variant", {}).get("value", ""))
+                    if sql_val:
+                        self._cubes[-1]["sql_preview"] = sql_val
+                log.debug(f"    [FREEFORM CUBE] {cname} -- SQL captured, skipping schema traversal")
+                continue   # no attributes/metrics to traverse
+
+            # Schema-based cube -- traverse metrics and attributes normally
+            metrics, attrs = self._extract_units(detail)
+            for m in metrics:
                 mid = safe(m.get("id"))
                 if not mid:
                     continue
-                self._br_cube_metric.append({"project_id": pid, "cube_id": cid, "metric_id": mid})
-                self._register_metric(mid, safe(m.get("name","")), pid)
+                self._br_cm.append({"project_id": pid,
+                                    "cube_id": cid, "metric_id": mid})
+                self._register_metric(mid, safe(m.get("name", "")), pid)
 
-            for a in avail.get("attributes",[]):
+            for a in attrs:
                 aid = safe(a.get("id"))
                 if not aid:
                     continue
-                self._br_cube_attr.append({"project_id": pid, "cube_id": cid, "attribute_id": aid})
-                self._register_attribute(aid, safe(a.get("name","")), pid)
+                self._br_ca.append({"project_id": pid,
+                                    "cube_id": cid, "attribute_id": aid})
+                self._register_attribute(aid, safe(a.get("name", "")), pid)
 
-    # -- Documents / Dossiers --------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Cube filters and prompts
+    # -------------------------------------------------------------------------
+    def _harvest_cube_filter_prompt(self, cid: str, cname: str,
+                                    pid: str, detail: dict):
+        """Extract filter and prompts from a cube definition."""
+        # Cube filter (same structure as report filter)
+        cube_filter = detail.get("filter", {}) or {}
+        fid_inline  = safe(cube_filter.get("objectId", cube_filter.get("id", "")))
+        if fid_inline:
+            self._register_filter(fid_inline,
+                                  safe(cube_filter.get("name", "")), pid)
+            self._br_cf.append({"project_id": pid,
+                                 "cube_id": cid, "filter_id": fid_inline})
+        else:
+            qual = cube_filter.get("qualification", {}) or {}
+            expr = safe(qual.get("text", ""))
+            if expr:
+                synthetic_id = f"inline_{cid}"
+                self._filters.append({
+                    "project_id":        pid,
+                    "filter_id":         synthetic_id,
+                    "filter_name":       f"{cname} [Cube Filter]",
+                    "filter_expression": expr,
+                })
+                self._br_cf.append({"project_id": pid,
+                                     "cube_id": cid, "filter_id": synthetic_id})
 
+        # Cube prompts -- GET /api/cubes/{id}/prompts
+        prompts_resp = self.c.get(f"/cubes/{cid}/prompts", pid=pid)
+        for pr in (prompts_resp if isinstance(prompts_resp, list) else []):
+            prid   = safe(pr.get("id", pr.get("key", "")))
+            prname = safe(pr.get("name", ""))
+            prtype = safe(pr.get("type", pr.get("promptType", "")))
+            if prid:
+                self._register_prompt(prid, prname, prtype, pid)
+                self._br_cp.append({"project_id": pid,
+                                     "cube_id": cid, "prompt_id": prid})
+
+    # -------------------------------------------------------------------------
+    # Documents / Dossiers
+    # -------------------------------------------------------------------------
     def harvest_documents(self, pid: str, pname: str):
         log.info(f"  [DOCUMENTS] {pname}...")
         for obj in self.c.search_all(TYPE_DOCUMENT, pid):
-            did    = safe(obj.get("id"))
-            dname  = safe(obj.get("name"))
+            did     = safe(obj.get("id"))
+            dname   = safe(obj.get("name"))
             subtype = "Dossier" if obj.get("subtype") == 14081 else "Document"
             self._documents.append({
-                "project_id": pid, "doc_id": did,
-                "doc_name": dname, "doc_subtype": subtype
+                "project_id": pid,
+                "doc_id":     did,
+                "doc_name":   dname,
+                "doc_subtype": subtype,
             })
             detail = (self.c.get(f"/dossiers/{did}/definition", pid=pid) or
                       self.c.get(f"/documents/{did}/definition", pid=pid))
             if not detail:
                 continue
-            for ds in detail.get("datasets",[]):
+            for ds in detail.get("datasets", []):
                 ds_id = safe(ds.get("id"))
                 if ds_id:
-                    self._br_doc_ds.append({
+                    self._br_dd.append({
                         "project_id":   pid,
                         "doc_id":       did,
                         "dataset_id":   ds_id,
-                        "dataset_type": safe(ds.get("type",""))
+                        "dataset_name": safe(ds.get("name", "")),
+                        "dataset_type": safe(ds.get("type", "")),
                     })
 
-    # -- Standalone passes -----------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Facts (standalone pass)
+    # -------------------------------------------------------------------------
+    def harvest_facts(self, pid: str, pname: str):
+        log.info(f"  [FACTS] {pname}...")
+        for obj in self.c.search_all(TYPE_FACT, pid):
+            self._register_fact(safe(obj.get("id")),
+                                safe(obj.get("name", "")), pid)
 
+    # -------------------------------------------------------------------------
+    # Standalone metric + attribute passes (catch anything missed by reports)
+    # -------------------------------------------------------------------------
     def harvest_standalone_metrics(self, pid: str, pname: str):
-        log.info(f"  [STANDALONE METRICS] {pname}...")
-        for m in self.c.search_all(TYPE_METRIC, pid):
-            self._register_metric(safe(m.get("id")), safe(m.get("name","")), pid)
+        for obj in self.c.search_all(TYPE_METRIC, pid):
+            self._register_metric(safe(obj.get("id")),
+                                  safe(obj.get("name", "")), pid)
 
     def harvest_standalone_attributes(self, pid: str, pname: str):
-        log.info(f"  [STANDALONE ATTRIBUTES] {pname}...")
-        for a in self.c.search_all(TYPE_ATTRIBUTE, pid):
-            self._register_attribute(safe(a.get("id")), safe(a.get("name","")), pid)
+        for obj in self.c.search_all(TYPE_ATTRIBUTE, pid):
+            self._register_attribute(safe(obj.get("id")),
+                                     safe(obj.get("name", "")), pid)
 
-    # -- Datasource table topology ---------------------------------------------
-
-    def harvest_datasource_topology(self):
-        log.info("  [DS TOPOLOGY] Fetching datasource table/column lists...")
-        for ds in self._datasources:
-            did = ds["datasource_id"]
-            resp = self.c.get(f"/datasources/{did}/tables")
-            for tbl in resp.get("tables",[]):
-                tid   = safe(tbl.get("id"))
-                tname = safe(tbl.get("name"))
-                cols  = tbl.get("columns",[])
-                key   = f"__global__:{tid}"
-                if any(f"{r['project_id']}:{r['table_id']}" == key for r in self._tables):
-                    continue
-                self._tables.append({
-                    "project_id":    "__global__",
-                    "table_id":      tid,
-                    "table_name":    tname,
-                    "datasource_id": did
-                })
-                for col in cols:
-                    self._columns.append({
-                        "project_id":       "__global__",
-                        "table_id":         tid,
-                        "table_name":       tname,
-                        "column_name":      safe(col.get("columnName", col.get("name",""))),
-                        "column_data_type": safe(col.get("dataType",""))
-                    })
-
-    # -- Per-project orchestrator ----------------------------------------------
-
+    # -------------------------------------------------------------------------
+    # Per-project orchestrator
+    # -------------------------------------------------------------------------
     def harvest_project(self, pid: str, pname: str):
         print(f"\n    Project : {pname}")
         print(f"    ID      : {pid}")
-        print(f"    {'-'*55}")
-        log.info(f"\n  == Project: {pname} ({pid}) ==")
+        print(f"    {'--' * 28}")
+        log.info(f"  == Project: {pname} ({pid}) ==")
+        self.harvest_objects(pid, pname)
         self.harvest_reports(pid, pname)
         self.harvest_cubes(pid, pname)
         self.harvest_documents(pid, pname)
+        self.harvest_facts(pid, pname)
         self.harvest_standalone_metrics(pid, pname)
         self.harvest_standalone_attributes(pid, pname)
-        rpt_count  = sum(1 for r in self._reports   if r["project_id"] == pid)
-        cube_count = sum(1 for c in self._cubes      if c["project_id"] == pid)
-        doc_count  = sum(1 for d in self._documents  if d["project_id"] == pid)
-        met_count  = sum(1 for m in self._metrics    if m["project_id"] == pid)
-        attr_count = sum(1 for a in self._attributes if a["project_id"] == pid)
-        ff_count   = sum(1 for f in self._freeform_sqls if f["project_id"] == pid)
-        cs_count   = sum(1 for c in self._cube_sourced_reports if c["project_id"] == pid)
-        print(f"    Reports (grid/graph): {rpt_count - ff_count - cs_count}  |  Freeform SQL: {ff_count}  |  Cube-sourced: {cs_count}")
-        print(f"    Cubes: {cube_count}  |  Docs/Dossiers: {doc_count}  |  Metrics: {met_count}  |  Attributes: {attr_count}")
 
-    # -- Build DataFrames ------------------------------------------------------
+        # Per-project summary
+        r_count = sum(1 for r in self._reports    if r["project_id"] == pid)
+        c_count = sum(1 for c in self._cubes       if c["project_id"] == pid)
+        d_count = sum(1 for d in self._documents   if d["project_id"] == pid)
+        m_count = sum(1 for m in self._metrics     if m["project_id"] == pid)
+        a_count = sum(1 for a in self._attributes  if a["project_id"] == pid)
+        f_count  = sum(1 for f in self._facts    if f["project_id"] == pid)
+        fl_count = sum(1 for f in self._filters  if f["project_id"] == pid)
+        pr_count = sum(1 for p in self._prompts  if p["project_id"] == pid)
+        print(f"    Reports: {r_count}  Cubes: {c_count}  Docs: {d_count}")
+        print(f"    Metrics: {m_count}  Attrs: {a_count}  Facts: {f_count}"
+              f"  Filters: {fl_count}  Prompts: {pr_count}")
 
+    # -------------------------------------------------------------------------
+    # Build DataFrames
+    # -------------------------------------------------------------------------
     def build_dataframes(self) -> dict:
-        log.info("\n[PHASE 2 -> DFs] Normalizing accumulators into DataFrames...")
-        empty_df = lambda cols: pd.DataFrame(columns=cols)
+        step("PHASE 2", "Building normalized DataFrames...")
 
-        def to_df(rows, dedup_cols=None):
+        def to_df(rows, dedup=None):
             if not rows:
                 return pd.DataFrame()
             df = pd.DataFrame(rows)
-            if dedup_cols:
-                df = df.drop_duplicates(subset=dedup_cols)
-            else:
-                df = df.drop_duplicates()
-            return df
+            return df.drop_duplicates(subset=dedup) if dedup else df.drop_duplicates()
 
         dfs = {
-            "df_reports":        to_df(self._reports,        ["project_id","report_id"]),
-            "df_cubes":          to_df(self._cubes,          ["project_id","cube_id"]),
-            "df_documents":      to_df(self._documents,      ["project_id","doc_id"]),
-            "df_metrics":        to_df(self._metrics,        ["project_id","metric_id"]),
-            "df_attributes":     to_df(self._attributes,     ["project_id","attribute_id"]),
-            "df_attr_forms":     to_df(self._attr_forms),
-            "df_br_rpt_metric":  to_df(self._br_rpt_metric),
-            "df_br_rpt_attr":    to_df(self._br_rpt_attr),
-            "df_br_cube_metric": to_df(self._br_cube_metric),
-            "df_br_cube_attr":   to_df(self._br_cube_attr),
-            "df_br_doc_ds":           to_df(self._br_doc_ds),
-            "df_freeform_sqls":        to_df(self._freeform_sqls,       ["project_id","report_id"]),
-            "df_cube_sourced_reports": to_df(self._cube_sourced_reports, ["project_id","report_id"]),
-            "df_datasources":          to_df(self._datasources,          ["datasource_id"]),
-            "df_tables":         to_df(self._tables,         ["project_id","table_id"]),
-            "df_columns":        to_df(self._columns)
+            "df_objects":      to_df(self._objects,    ["project_id", "object_id"]),
+            "df_reports":      to_df(self._reports,    ["project_id", "report_id"]),
+            "df_cubes":        to_df(self._cubes,      ["project_id", "cube_id"]),
+            "df_documents":    to_df(self._documents,  ["project_id", "doc_id"]),
+            "df_metrics":      to_df(self._metrics,    ["project_id", "metric_id"]),
+            "df_attributes":   to_df(self._attributes, ["project_id", "attribute_id"]),
+            "df_attr_forms":   to_df(self._attr_forms),
+            "df_facts":        to_df(self._facts),
+            "df_br_rpt_metric":to_df(self._br_rm),
+            "df_br_rpt_attr":  to_df(self._br_ra),
+            "df_br_cube_metric":to_df(self._br_cm),
+            "df_br_cube_attr": to_df(self._br_ca),
+            "df_br_doc_ds":    to_df(self._br_dd),
+            "df_filters":      to_df(self._filters,   ["project_id","filter_id"]),
+            "df_prompts":      to_df(self._prompts,   ["project_id","prompt_id"]),
+            "df_br_rpt_filter":to_df(self._br_rf),
+            "df_br_cube_filter":to_df(self._br_cf),
+            "df_br_rpt_prompt":to_df(self._br_rp),
+            "df_br_cube_prompt":to_df(self._br_cp),
+            "df_datasources":  to_df(self._datasources, ["datasource_id"]),
+            "df_tables":       to_df(self._tables,     ["project_id", "table_id"]),
+            "df_columns":      to_df(self._columns),
         }
 
         for name, df in dfs.items():
@@ -770,423 +985,1084 @@ class HarvestEngine:
         return dfs
 
 
-# -----------------------------------------------------------------------------
-# PHASE 3 -- JOIN CHAIN -> FINAL LINEAGE DataFrame
-# -----------------------------------------------------------------------------
-
+# =============================================================================
+# PHASE 3 -- LINEAGE JOINER
+# =============================================================================
 class LineageJoiner:
     """
-    Joins normalized DataFrames into one edge-grain lineage DataFrame.
+    Joins all DataFrames into one edge-grain lineage DataFrame.
+
+    df_objects is the universal backbone -- every parent_node_id and
+    child_node_id in df_lineage joins back to df_objects.object_id
+    to get object_type, object_name, folder, owner for any node.
 
     Edge grain: one row = one directional relationship.
-    If a cube has 10 attributes, there are 10 Cube->Attribute rows.
-    If attribute A has 2 forms, there are 2 Attribute->Form rows under it.
-    If a form maps to a table with 15 columns, there are 15 Table->Column rows.
     """
 
+    # -------------------------------------------------------------------------
+    # FINAL FLAT TABLE STRUCTURE
+    # One row = one lineage path.  Same columns for ALL object types.
+    #
+    # SCHEMA rows  (attribute or metric):
+    #   object_type       = "Attribute" or "Metric"
+    #   object_name       = attribute or metric name
+    #   attribute_column  = physical column from attribute form expression
+    #   metric_formula    = metric formula text
+    #   sql_preview       = blank
+    #   table_name        = physical table
+    #   column_name       = physical column
+    #   db_instance_name  = always filled
+    #
+    # FREEFORM rows  (no attributes/metrics):
+    #   object_type       = "FreeformSQL"
+    #   object_name       = blank
+    #   attribute_column  = blank
+    #   metric_formula    = blank
+    #   sql_preview       = full SQL
+    #   table_name        = one of the tables extracted from the SQL
+    #   column_name       = blank (freeform has no column mapping)
+    #   db_instance_name  = always filled
+    #
+    # FILTER / PROMPT rows:
+    #   object_type       = "Filter" or "Prompt"
+    #   object_name       = filter/prompt name
+    #   filter_expression = filter expression text
+    #   prompt_type       = prompt type
+    #   table/column/db   = blank (filters don't map to physical layer directly)
+    # -------------------------------------------------------------------------
     FINAL_COLS = [
         "lineage_row_id",
-        "project_id", "project_name",
-        "top_object_type", "top_object_id", "top_object_name",
-        "edge_type",
-        "parent_node_type", "parent_node_id", "parent_node_name",
-        "child_node_type",  "child_node_id",  "child_node_name",
-        "node_level",
-        "metric_formula", "metric_expression",
-        "form_name", "form_expression",
-        "cube_sql_preview",
-        "datasource_id", "db_instance_name", "dsn_name", "db_type",
-        "table_id", "table_name",
-        "column_name", "column_data_type",
-        "report_subtype", "doc_subtype", "dataset_type",
-        "harvested_at"
+        # -- Who owns this lineage path --------------------------------------
+        "project_id",
+        "project_name",
+        "app_name",           # Dossier / Document name  (the application)
+        "app_folder",         # folder the dossier lives in
+        "app_owner",          # owner of the dossier
+        # -- The dataset (cube or report) ------------------------------------
+        "dataset_name",       # cube or report name
+        "dataset_type",       # Schema Cube / Freeform Cube / Grid Report / Freeform Report
+        "dataset_folder",     # folder of the cube/report
+        "dataset_owner",      # owner of the cube/report
+        # -- The object on that dataset --------------------------------------
+        "object_type",        # Attribute / Metric / Filter / Prompt / FreeformSQL
+        "object_name",        # attribute/metric/filter/prompt name  (blank for freeform)
+        # -- Schema enrichment -----------------------------------------------
+        "attribute_column",   # column used in attribute form expression  (schema only)
+        "metric_formula",     # metric formula text                       (schema only)
+        "filter_expression",  # filter qualification text                 (filter rows)
+        "prompt_type",        # prompt type                               (prompt rows)
+        # -- Freeform enrichment ---------------------------------------------
+        "sql_preview",        # full SQL                                  (freeform only)
+        # -- Physical layer -- populated for EVERYONE ------------------------
+        "table_name",         # physical table name
+        "column_name",        # physical column  (blank for freeform)
+        "column_data_type",   # column data type (blank for freeform)
+        "db_instance_name",   # database instance name
+        "dsn_name",           # DSN connection name
+        "db_type",            # SQL Server / Oracle / Redshift etc
+        # -- Metadata --------------------------------------------------------
+        "report_subtype",     # 768=Grid 772=Freeform 774=CubeSourced
+        "cube_source_type",   # normal / custom_sql_free_form
+        "harvested_at",
     ]
 
     def __init__(self, dfs: dict, df_projects: pd.DataFrame):
         self.dfs      = dfs
         self.projects = df_projects
         self.ts       = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        self._edges: list = []
+        self._edges:  list = []
+
+    # -- Lookups ---------------------------------------------------------------
 
     def _pname(self, pid: str) -> str:
         row = self.projects[self.projects["project_id"] == pid]
         return row["project_name"].iloc[0] if not row.empty else pid
 
-    def _ds_info(self, ds_id: str) -> dict:
-        ds = self.dfs["df_datasources"]
-        row = ds[ds["datasource_id"] == ds_id] if ds_id else pd.DataFrame()
-        if not row.empty:
-            return {
-                "datasource_id":    ds_id,
-                "db_instance_name": row["db_instance_name"].iloc[0],
-                "dsn_name":         row["dsn_name"].iloc[0],
-                "db_type":          row["db_type"].iloc[0]
-            }
-        return {"datasource_id": ds_id, "db_instance_name": "", "dsn_name": "", "db_type": ""}
-
-    def _get_table_ds(self, tbl_id: str, pid: str) -> str:
-        tbls = self.dfs["df_tables"]
-        row  = tbls[(tbls["project_id"] == pid) & (tbls["table_id"] == tbl_id)]
+    def _obj(self, oid: str, pid: str) -> dict:
+        """Look up an object in df_objects."""
+        df = self.dfs["df_objects"]
+        if df.empty or "object_id" not in df.columns:
+            return {}
+        row = df[(df["object_id"] == oid) & (df["project_id"] == pid)]
         if row.empty:
-            row = tbls[(tbls["project_id"] == "__global__") & (tbls["table_id"] == tbl_id)]
+            row = df[df["object_id"] == oid]
+        return row.iloc[0].to_dict() if not row.empty else {}
+
+    def _ds(self, ds_id: str) -> dict:
+        df = self.dfs["df_datasources"]
+        if df.empty or "datasource_id" not in df.columns:
+            return {}
+        row = df[df["datasource_id"] == ds_id]
+        return row.iloc[0].to_dict() if not row.empty else {}
+
+    def _tbl_ds(self, tbl_id: str, pid: str) -> str:
+        df = self.dfs["df_tables"]
+        if df.empty:
+            return ""
+        row = df[(df["table_id"] == tbl_id) & (df["project_id"] == pid)]
+        if row.empty:
+            row = df[df["table_id"] == tbl_id]
         return row["datasource_id"].iloc[0] if not row.empty else ""
 
-    def _get_columns(self, tbl_id: str, pid: str) -> pd.DataFrame:
-        cols = self.dfs["df_columns"]
-        res  = cols[(cols["project_id"] == pid) & (cols["table_id"] == tbl_id)]
-        if res.empty:
-            res = cols[(cols["project_id"] == "__global__") & (cols["table_id"] == tbl_id)]
-        return res
+    def _cols(self, tbl_id: str, pid: str) -> pd.DataFrame:
+        df = self.dfs["df_columns"]
+        if df.empty:
+            return pd.DataFrame()
+        res = df[(df["table_id"] == tbl_id) & (df["project_id"] == pid)]
+        return res if not res.empty else df[df["table_id"] == tbl_id]
 
-    def _e(self, **kwargs) -> dict:
-        """Build one edge row with all FINAL_COLS defaulted."""
-        defaults = {c: "" for c in self.FINAL_COLS}
-        defaults["node_level"]    = 0
-        defaults["harvested_at"]  = self.ts
-        defaults.update(kwargs)
-        return defaults
+    # -- Edge builder ----------------------------------------------------------
+
+    def _e(self, **kw) -> dict:
+        row = {c: "" for c in self.FINAL_COLS}
+        row["node_level"]   = 0
+        row["harvested_at"] = self.ts
+        row.update(kw)
+        return row
+
+    def _enrich_node(self, oid: str, pid: str) -> dict:
+        """Get folder and owner for a node from df_objects."""
+        info = self._obj(oid, pid)
+        return {
+            "folder": info.get("folder_name", ""),
+            "owner":  info.get("owner", ""),
+        }
+
+    # -- Table -> Column edges -------------------------------------------------
+
+    def _table_column_edges(self, tbl_id: str, tbl_name: str,
+                            top_type: str, top_id: str, top_name: str,
+                            pid: str, pname: str, level: int,
+                            extra: dict = None):
+        ds_id  = self._tbl_ds(tbl_id, pid)
+        ds_inf = self._ds(ds_id) if ds_id else {}
+        extra  = extra or {}
+
+        for _, col in self._cols(tbl_id, pid).iterrows():
+            self._edges.append(self._e(
+                project_id=pid, project_name=pname,
+                top_object_type=top_type, top_object_id=top_id,
+                top_object_name=top_name,
+                edge_type="Table->Column",
+                parent_node_type="Table", parent_node_id=tbl_id,
+                parent_node_name=tbl_name,
+                child_node_type="Column", child_node_id="",
+                child_node_name=col.get("column_name", ""),
+                node_level=level,
+                table_id=tbl_id, table_name=tbl_name,
+                column_name=col.get("column_name", ""),
+                column_data_type=col.get("column_data_type", ""),
+                datasource_id=ds_id,
+                db_instance_name=ds_inf.get("db_instance_name", ""),
+                dsn_name=ds_inf.get("dsn_name", ""),
+                db_type=ds_inf.get("db_type", ""),
+                **extra
+            ))
+
+    # -- Attribute -> Form -> Table -> Column ----------------------------------
+
+    def _attr_chain(self, aid: str, aname: str,
+                    top_type: str, top_id: str, top_name: str,
+                    pid: str, pname: str, base_level: int):
+        forms = self.dfs["df_attr_forms"]
+        if forms.empty:
+            return
+
+        af = forms[(forms["project_id"] == pid) & (forms["attribute_id"] == aid)]
+        for _, f in af.iterrows():
+            tbl_id   = safe(f.get("table_id", ""))
+            tbl_name = safe(f.get("table_name", ""))
+            ds_id    = self._tbl_ds(tbl_id, pid) if tbl_id else ""
+            ds_inf   = self._ds(ds_id) if ds_id else {}
+
+            # Attribute -> Form edge
+            self._edges.append(self._e(
+                project_id=pid, project_name=pname,
+                top_object_type=top_type, top_object_id=top_id,
+                top_object_name=top_name,
+                edge_type="Attribute->Form",
+                parent_node_type="Attribute", parent_node_id=aid,
+                parent_node_name=aname,
+                child_node_type="AttributeForm", child_node_id=aid,
+                child_node_name=f"{aname} [{f.get('form_name','')}]",
+                node_level=base_level,
+                form_name=safe(f.get("form_name", "")),
+                form_expression=safe(f.get("form_expression", "")),
+                table_id=tbl_id, table_name=tbl_name,
+                datasource_id=ds_id,
+                db_instance_name=ds_inf.get("db_instance_name", ""),
+                dsn_name=ds_inf.get("dsn_name", ""),
+                db_type=ds_inf.get("db_type", ""),
+            ))
+
+            # Table -> Column edges
+            if tbl_id:
+                self._table_column_edges(
+                    tbl_id, tbl_name,
+                    top_type, top_id, top_name,
+                    pid, pname, base_level + 1)
 
     # -- Report edges ----------------------------------------------------------
 
     def _report_edges(self):
+        step("PHASE 3", "Building report lineage edges...")
+        rpts  = self.dfs["df_reports"]
         br_m  = self.dfs["df_br_rpt_metric"]
         br_a  = self.dfs["df_br_rpt_attr"]
-        rpts  = self.dfs["df_reports"]
         mets  = self.dfs["df_metrics"]
         attrs = self.dfs["df_attributes"]
-        forms = self.dfs["df_attr_forms"]
 
-        # Report -> Metric -> Formula
-        m_merged = (br_m.merge(rpts, on=["project_id","report_id"], how="left")
-                        .merge(mets, on=["project_id","metric_id"], how="left"))
-        for _, r in m_merged.iterrows():
-            pid   = r["project_id"]
-            pname = self._pname(pid)
-            self._edges.append(self._e(
-                project_id=pid, project_name=pname,
-                top_object_type="Report", top_object_id=r["report_id"], top_object_name=r.get("report_name",""),
-                edge_type="Report->Metric",
-                parent_node_type="Report",  parent_node_id=r["report_id"], parent_node_name=r.get("report_name",""),
-                child_node_type="Metric",   child_node_id=r["metric_id"],  child_node_name=r.get("metric_name",""),
-                node_level=2,
-                report_subtype=str(r.get("report_subtype","")),
-                metric_formula=r.get("metric_formula",""),
-                metric_expression=r.get("metric_expression","")
-            ))
-            if r.get("metric_formula"):
+        if rpts.empty:
+            return
+
+        for _, rpt in rpts.iterrows():
+            pid     = rpt["project_id"]
+            rid     = rpt["report_id"]
+            rname   = rpt.get("report_name", "")
+            subtype = safe(rpt.get("report_subtype", ""))
+            pname   = self._pname(pid)
+            obj_inf = self._enrich_node(rid, pid)
+
+            # Freeform SQL
+            sql_prev = safe(rpt.get("sql_preview", ""))
+            if subtype == str(SUBTYPE_FREEFORM):
                 self._edges.append(self._e(
                     project_id=pid, project_name=pname,
-                    top_object_type="Report", top_object_id=r["report_id"], top_object_name=r.get("report_name",""),
-                    edge_type="Metric->Formula",
-                    parent_node_type="Metric",        parent_node_id=r["metric_id"], parent_node_name=r.get("metric_name",""),
-                    child_node_type="MetricFormula",  child_node_id=r["metric_id"],  child_node_name=f"{r.get('metric_name','')} [Formula]",
-                    node_level=3,
-                    metric_formula=r.get("metric_formula",""),
-                    metric_expression=r.get("metric_expression","")
+                    top_object_type="Report", top_object_id=rid,
+                    top_object_name=rname,
+                    edge_type="Report->FreeformSQL",
+                    parent_node_type="Report", parent_node_id=rid,
+                    parent_node_name=rname,
+                    child_node_type="FreeformSQL", child_node_id=rid,
+                    child_node_name=f"{rname} [SQL]",
+                    node_level=2, report_subtype=subtype,
+                    sql_preview=sql_prev,
+                    parent_folder=obj_inf.get("folder", ""),
+                    parent_owner=obj_inf.get("owner", ""),
+                ))
+                continue
+
+            # Cube-sourced report
+            if subtype == str(SUBTYPE_CUBE_RPT):
+                src_cube_id   = safe(rpt.get("source_cube_id", ""))
+                src_cube_name = safe(rpt.get("source_cube_name", ""))
+                self._edges.append(self._e(
+                    project_id=pid, project_name=pname,
+                    top_object_type="Report", top_object_id=rid,
+                    top_object_name=rname,
+                    edge_type="Report->Cube(OLAP)",
+                    parent_node_type="Report", parent_node_id=rid,
+                    parent_node_name=rname,
+                    child_node_type="Cube", child_node_id=src_cube_id,
+                    child_node_name=src_cube_name,
+                    node_level=2, report_subtype=subtype,
+                    parent_folder=obj_inf.get("folder", ""),
+                    parent_owner=obj_inf.get("owner", ""),
+                ))
+                continue
+
+            # Guard empty bridges
+            if br_m.empty or "report_id" not in br_m.columns:
+                continue
+
+            # Report -> Metric
+            r_mets = br_m[br_m["report_id"] == rid]
+            r_mets = r_mets.merge(mets, on=["project_id", "metric_id"],
+                                  how="left") if not r_mets.empty else pd.DataFrame()
+            for _, m in r_mets.iterrows():
+                mid    = safe(m.get("metric_id", ""))
+                mname  = safe(m.get("metric_name", ""))
+                m_inf  = self._enrich_node(mid, pid)
+                self._edges.append(self._e(
+                    project_id=pid, project_name=pname,
+                    top_object_type="Report", top_object_id=rid,
+                    top_object_name=rname,
+                    edge_type="Report->Metric",
+                    parent_node_type="Report", parent_node_id=rid,
+                    parent_node_name=rname,
+                    child_node_type="Metric", child_node_id=mid,
+                    child_node_name=mname,
+                    node_level=2, report_subtype=subtype,
+                    metric_formula=safe(m.get("metric_formula", "")),
+                    parent_folder=obj_inf.get("folder", ""),
+                    parent_owner=obj_inf.get("owner", ""),
+                    child_folder=m_inf.get("folder", ""),
+                    child_owner=m_inf.get("owner", ""),
                 ))
 
-        # Report -> Attribute -> Form -> Table -> Column
-        a_merged = (br_a.merge(rpts, on=["project_id","report_id"], how="left")
-                        .merge(attrs, on=["project_id","attribute_id"], how="left"))
-        for _, r in a_merged.iterrows():
-            pid   = r["project_id"]
-            pname = self._pname(pid)
-            aid   = r["attribute_id"]
-            aname = r.get("attribute_name","")
-            self._edges.append(self._e(
-                project_id=pid, project_name=pname,
-                top_object_type="Report", top_object_id=r["report_id"], top_object_name=r.get("report_name",""),
-                edge_type="Report->Attribute",
-                parent_node_type="Report",    parent_node_id=r["report_id"], parent_node_name=r.get("report_name",""),
-                child_node_type="Attribute",  child_node_id=aid,             child_node_name=aname,
-                node_level=2
-            ))
-            self._attribute_form_column_edges(
-                aid, aname, "Report", r["report_id"], r.get("report_name",""),
-                pid, pname, forms, 3
-            )
-
-    # -- Freeform SQL report edges ---------------------------------------------
-
-    def _freeform_sql_edges(self):
-        """
-        Freeform SQL reports have no attribute/metric/table lineage.
-        Emit one edge: Report -> FreeformSQL  with the SQL captured as enrichment.
-        """
-        df = self.dfs.get("df_freeform_sqls", pd.DataFrame())
-        if df.empty:
-            return
-        rpts = self.dfs["df_reports"]
-        for _, r in df.iterrows():
-            pid   = r["project_id"]
-            pname = self._pname(pid)
-            self._edges.append(self._e(
-                project_id=pid, project_name=pname,
-                top_object_type="Report", top_object_id=r["report_id"], top_object_name=r["report_name"],
-                edge_type="Report->FreeformSQL",
-                parent_node_type="Report",      parent_node_id=r["report_id"], parent_node_name=r["report_name"],
-                child_node_type="FreeformSQL",  child_node_id=r["report_id"],  child_node_name=f"{r['report_name']} [Freeform SQL]",
-                node_level=2,
-                cube_sql_preview=r.get("freeform_sql","")   # reusing sql preview column
-            ))
-
-    # -- Cube-sourced report edges ----------------------------------------------
-
-    def _cube_sourced_report_edges(self):
-        """
-        OLAP / cube-sourced reports point to an Intelligent Cube, not directly to tables.
-        Emit one edge: Report -> Cube  (the cube's own lineage covers the rest).
-        """
-        df = self.dfs.get("df_cube_sourced_reports", pd.DataFrame())
-        if df.empty:
-            return
-        for _, r in df.iterrows():
-            pid   = r["project_id"]
-            pname = self._pname(pid)
-            self._edges.append(self._e(
-                project_id=pid, project_name=pname,
-                top_object_type="Report", top_object_id=r["report_id"], top_object_name=r["report_name"],
-                edge_type="Report->Cube(OLAP)",
-                parent_node_type="Report", parent_node_id=r["report_id"], parent_node_name=r["report_name"],
-                child_node_type="Cube",    child_node_id=r.get("source_cube_id",""),  child_node_name=r.get("source_cube_name",""),
-                node_level=2
-            ))
+            # Report -> Attribute -> Form -> Table -> Column
+            if br_a.empty or "report_id" not in br_a.columns:
+                continue
+            r_attrs = br_a[br_a["report_id"] == rid]
+            r_attrs = r_attrs.merge(attrs, on=["project_id", "attribute_id"],
+                                    how="left") if not r_attrs.empty else pd.DataFrame()
+            for _, a in r_attrs.iterrows():
+                aid   = safe(a.get("attribute_id", ""))
+                aname = safe(a.get("attribute_name", ""))
+                a_inf = self._enrich_node(aid, pid)
+                self._edges.append(self._e(
+                    project_id=pid, project_name=pname,
+                    top_object_type="Report", top_object_id=rid,
+                    top_object_name=rname,
+                    edge_type="Report->Attribute",
+                    parent_node_type="Report", parent_node_id=rid,
+                    parent_node_name=rname,
+                    child_node_type="Attribute", child_node_id=aid,
+                    child_node_name=aname,
+                    node_level=2, report_subtype=subtype,
+                    parent_folder=obj_inf.get("folder", ""),
+                    parent_owner=obj_inf.get("owner", ""),
+                    child_folder=a_inf.get("folder", ""),
+                    child_owner=a_inf.get("owner", ""),
+                ))
+                self._attr_chain(aid, aname, "Report", rid, rname,
+                                 pid, pname, 3)
 
     # -- Cube edges ------------------------------------------------------------
 
     def _cube_edges(self):
+        step("PHASE 3", "Building cube lineage edges...")
         cubes = self.dfs["df_cubes"]
         br_m  = self.dfs["df_br_cube_metric"]
         br_a  = self.dfs["df_br_cube_attr"]
         mets  = self.dfs["df_metrics"]
         attrs = self.dfs["df_attributes"]
-        forms = self.dfs["df_attr_forms"]
+
+        if cubes.empty:
+            return
 
         for _, cube in cubes.iterrows():
             pid   = cube["project_id"]
             cid   = cube["cube_id"]
-            cname = cube["cube_name"]
+            cname = cube.get("cube_name", "")
             pname = self._pname(pid)
+            c_inf = self._enrich_node(cid, pid)
+            sql   = safe(cube.get("sql_preview", ""))
 
-            if cube.get("cube_sql_preview"):
+            src_type = safe(cube.get("cube_source_type", ""))
+            if sql:
+                # Freeform SQL cube -- edge type makes it explicit
+                edge_lbl = "Cube->FreeformSQL" if src_type == "custom_sql_free_form" else "Cube->SQL"
                 self._edges.append(self._e(
                     project_id=pid, project_name=pname,
-                    top_object_type="Cube", top_object_id=cid, top_object_name=cname,
-                    edge_type="Cube->SQL",
-                    parent_node_type="Cube",    parent_node_id=cid, parent_node_name=cname,
-                    child_node_type="CubeSQL",  child_node_id=cid,  child_node_name=f"{cname} [SQL]",
-                    node_level=2,
-                    cube_sql_preview=cube["cube_sql_preview"]
+                    top_object_type="Cube", top_object_id=cid,
+                    top_object_name=cname,
+                    edge_type=edge_lbl,
+                    parent_node_type="Cube", parent_node_id=cid,
+                    parent_node_name=cname,
+                    child_node_type="CubeSQL", child_node_id=cid,
+                    child_node_name=f"{cname} [{'Freeform SQL' if src_type == 'custom_sql_free_form' else 'SQL'}]",
+                    node_level=2, sql_preview=sql,
+                    cube_source_type=src_type,
+                    parent_folder=c_inf.get("folder", ""),
+                    parent_owner=c_inf.get("owner", ""),
                 ))
 
-            # Cube -> Metric -> Formula
-            cmet = br_m[(br_m["project_id"]==pid)&(br_m["cube_id"]==cid)].merge(mets, on=["project_id","metric_id"], how="left")
-            for _, m in cmet.iterrows():
+            if br_m.empty or "cube_id" not in br_m.columns:
+                continue
+
+            c_mets = br_m[br_m["cube_id"] == cid]
+            c_mets = c_mets.merge(mets, on=["project_id", "metric_id"],
+                                  how="left") if not c_mets.empty else pd.DataFrame()
+            for _, m in c_mets.iterrows():
+                mid    = safe(m.get("metric_id", ""))
+                mname  = safe(m.get("metric_name", ""))
+                m_inf  = self._enrich_node(mid, pid)
                 self._edges.append(self._e(
                     project_id=pid, project_name=pname,
-                    top_object_type="Cube", top_object_id=cid, top_object_name=cname,
+                    top_object_type="Cube", top_object_id=cid,
+                    top_object_name=cname,
                     edge_type="Cube->Metric",
-                    parent_node_type="Cube",   parent_node_id=cid,           parent_node_name=cname,
-                    child_node_type="Metric",  child_node_id=m["metric_id"],  child_node_name=m.get("metric_name",""),
+                    parent_node_type="Cube", parent_node_id=cid,
+                    parent_node_name=cname,
+                    child_node_type="Metric", child_node_id=mid,
+                    child_node_name=mname,
                     node_level=2,
-                    metric_formula=m.get("metric_formula",""),
-                    metric_expression=m.get("metric_expression","")
+                    metric_formula=safe(m.get("metric_formula", "")),
+                    parent_folder=c_inf.get("folder", ""),
+                    parent_owner=c_inf.get("owner", ""),
+                    child_folder=m_inf.get("folder", ""),
+                    child_owner=m_inf.get("owner", ""),
                 ))
-                if m.get("metric_formula"):
-                    self._edges.append(self._e(
-                        project_id=pid, project_name=pname,
-                        top_object_type="Cube", top_object_id=cid, top_object_name=cname,
-                        edge_type="Metric->Formula",
-                        parent_node_type="Metric",       parent_node_id=m["metric_id"], parent_node_name=m.get("metric_name",""),
-                        child_node_type="MetricFormula", child_node_id=m["metric_id"],  child_node_name=f"{m.get('metric_name','')} [Formula]",
-                        node_level=3,
-                        metric_formula=m.get("metric_formula",""),
-                        metric_expression=m.get("metric_expression","")
-                    ))
 
-            # Cube -> Attribute -> Form -> Table -> Column
-            cattr = br_a[(br_a["project_id"]==pid)&(br_a["cube_id"]==cid)].merge(
-                self.dfs["df_attributes"], on=["project_id","attribute_id"], how="left")
-            for _, a in cattr.iterrows():
-                aid   = a["attribute_id"]
-                aname = a.get("attribute_name","")
+            if br_a.empty or "cube_id" not in br_a.columns:
+                continue
+            c_attrs = br_a[br_a["cube_id"] == cid]
+            c_attrs = c_attrs.merge(attrs, on=["project_id", "attribute_id"],
+                                    how="left") if not c_attrs.empty else pd.DataFrame()
+            for _, a in c_attrs.iterrows():
+                aid   = safe(a.get("attribute_id", ""))
+                aname = safe(a.get("attribute_name", ""))
+                a_inf = self._enrich_node(aid, pid)
                 self._edges.append(self._e(
                     project_id=pid, project_name=pname,
-                    top_object_type="Cube", top_object_id=cid, top_object_name=cname,
+                    top_object_type="Cube", top_object_id=cid,
+                    top_object_name=cname,
                     edge_type="Cube->Attribute",
-                    parent_node_type="Cube",      parent_node_id=cid, parent_node_name=cname,
-                    child_node_type="Attribute",  child_node_id=aid,  child_node_name=aname,
-                    node_level=2
+                    parent_node_type="Cube", parent_node_id=cid,
+                    parent_node_name=cname,
+                    child_node_type="Attribute", child_node_id=aid,
+                    child_node_name=aname,
+                    node_level=2,
+                    parent_folder=c_inf.get("folder", ""),
+                    parent_owner=c_inf.get("owner", ""),
+                    child_folder=a_inf.get("folder", ""),
+                    child_owner=a_inf.get("owner", ""),
                 ))
-                self._attribute_form_column_edges(
-                    aid, aname, "Cube", cid, cname,
-                    pid, pname, forms, 3
-                )
-
-    # -- Shared: Attribute -> Form -> Table -> Column ---------------------------
-
-    def _attribute_form_column_edges(self, aid, aname, top_type, top_id, top_name,
-                                      pid, pname, forms_df, base_level):
-        """
-        For a given attribute, emit:
-          - one Attribute->Form edge per form expression  (base_level)
-          - one Table->Column edge per column in that form's table  (base_level+1)
-        """
-        attr_forms = forms_df[(forms_df["project_id"]==pid) & (forms_df["attribute_id"]==aid)]
-        for _, f in attr_forms.iterrows():
-            tbl_id   = f.get("table_id","")
-            tbl_name = f.get("table_name","")
-            ds_id    = self._get_table_ds(tbl_id, pid) if tbl_id else ""
-            ds_info  = self._ds_info(ds_id)
-
-            self._edges.append(self._e(
-                project_id=pid, project_name=pname,
-                top_object_type=top_type, top_object_id=top_id, top_object_name=top_name,
-                edge_type="Attribute->Form",
-                parent_node_type="Attribute",    parent_node_id=aid,  parent_node_name=aname,
-                child_node_type="AttributeForm", child_node_id=aid,
-                child_node_name=f"{aname} [{f.get('form_name','')}]",
-                node_level=base_level,
-                form_name=f.get("form_name",""),
-                form_expression=f.get("form_expression",""),
-                table_id=tbl_id, table_name=tbl_name,
-                **ds_info
-            ))
-
-            if tbl_id:
-                for _, col in self._get_columns(tbl_id, pid).iterrows():
-                    self._edges.append(self._e(
-                        project_id=pid, project_name=pname,
-                        top_object_type=top_type, top_object_id=top_id, top_object_name=top_name,
-                        edge_type="Table->Column",
-                        parent_node_type="Table",  parent_node_id=tbl_id, parent_node_name=tbl_name,
-                        child_node_type="Column",  child_node_id="",      child_node_name=col["column_name"],
-                        node_level=base_level+1,
-                        table_id=tbl_id, table_name=tbl_name,
-                        column_name=col["column_name"],
-                        column_data_type=col["column_data_type"],
-                        **ds_info
-                    ))
+                self._attr_chain(aid, aname, "Cube", cid, cname,
+                                 pid, pname, 3)
 
     # -- Document edges --------------------------------------------------------
 
     def _document_edges(self):
-        docs  = self.dfs["df_documents"]
-        br    = self.dfs["df_br_doc_ds"]
-        rpts  = self.dfs["df_reports"]
-        cubes = self.dfs["df_cubes"]
+        step("PHASE 3", "Building document lineage edges...")
+        docs = self.dfs["df_documents"]
+        br   = self.dfs["df_br_doc_ds"]
 
-        merged = br.merge(docs, on=["project_id","doc_id"], how="left")
+        if docs.empty or br.empty:
+            return
+
+        merged = br.merge(docs, on=["project_id", "doc_id"], how="left")
         for _, r in merged.iterrows():
-            pid   = r["project_id"]
-            pname = self._pname(pid)
-            child_type = "Cube" if str(r.get("dataset_type","")) == str(TYPE_CUBE) else "Report"
-            ds_name = ""
-            if child_type == "Report":
-                row = rpts[(rpts["project_id"]==pid)&(rpts["report_id"]==r["dataset_id"])]
-                if not row.empty:
-                    ds_name = row["report_name"].iloc[0]
-            else:
-                row = cubes[(cubes["project_id"]==pid)&(cubes["cube_id"]==r["dataset_id"])]
-                if not row.empty:
-                    ds_name = row["cube_name"].iloc[0]
+            pid      = r["project_id"]
+            pname    = self._pname(pid)
+            did      = r["doc_id"]
+            dname    = safe(r.get("doc_name", ""))
+            subtype  = safe(r.get("doc_subtype", "Document"))
+            ds_id    = r["dataset_id"]
+            ds_name  = safe(r.get("dataset_name", ""))
+            ds_type  = safe(r.get("dataset_type", ""))
+            d_inf    = self._enrich_node(did, pid)
+            ds_inf   = self._enrich_node(ds_id, pid)
+
+            child_type = "Cube" if ds_type == str(TYPE_CUBE) else "Report"
+            # Resolve name from objects if blank
+            if not ds_name:
+                obj = self._obj(ds_id, pid)
+                ds_name = obj.get("object_name", "")
 
             self._edges.append(self._e(
                 project_id=pid, project_name=pname,
-                top_object_type=r.get("doc_subtype","Document"),
-                top_object_id=r["doc_id"],
-                top_object_name=r.get("doc_name",""),
-                edge_type=f"{r.get('doc_subtype','Document')}->{child_type}",
-                parent_node_type=r.get("doc_subtype","Document"),
-                parent_node_id=r["doc_id"], parent_node_name=r.get("doc_name",""),
-                child_node_type=child_type, child_node_id=r["dataset_id"], child_node_name=ds_name,
-                node_level=2,
-                doc_subtype=r.get("doc_subtype",""),
-                dataset_type=str(r.get("dataset_type",""))
+                top_object_type=subtype, top_object_id=did,
+                top_object_name=dname,
+                edge_type=f"{subtype}->{child_type}",
+                parent_node_type=subtype, parent_node_id=did,
+                parent_node_name=dname,
+                child_node_type=child_type, child_node_id=ds_id,
+                child_node_name=ds_name,
+                node_level=2, doc_subtype=subtype,
+                parent_folder=d_inf.get("folder", ""),
+                parent_owner=d_inf.get("owner", ""),
+                child_folder=ds_inf.get("folder", ""),
+                child_owner=ds_inf.get("owner", ""),
             ))
 
-    # -- Standalone metric edges ------------------------------------------------
+    # -- Filter edges (Report/Cube -> Filter with expression) -----------------
 
-    def _standalone_metric_edges(self):
-        covered = {e["child_node_id"] for e in self._edges
-                   if e.get("edge_type","") in ("Report->Metric","Cube->Metric")}
-        for _, m in self.dfs["df_metrics"].iterrows():
-            if m["metric_id"] in covered:
+    def _filter_edges(self):
+        for obj_type, id_col, br_key in [
+            ("Report", "report_id", "df_br_rpt_filter"),
+            ("Cube",   "cube_id",   "df_br_cube_filter"),
+        ]:
+            obj_df = self.dfs.get(f"df_{obj_type.lower()}s", pd.DataFrame())
+            br_df  = self.dfs.get(br_key, pd.DataFrame())
+            flt_df = self.dfs.get("df_filters", pd.DataFrame())
+
+            if br_df.empty or flt_df.empty:
                 continue
-            pid   = m["project_id"]
+
+            merged = br_df.merge(flt_df, on=["project_id","filter_id"], how="left")
+            if not obj_df.empty and id_col in obj_df.columns:
+                name_col = "report_name" if obj_type == "Report" else "cube_name"
+                merged = merged.merge(
+                    obj_df[["project_id", id_col, name_col]],
+                    on=["project_id", id_col], how="left")
+
+            for _, r in merged.iterrows():
+                pid    = r["project_id"]
+                pname  = self._pname(pid)
+                oid    = safe(r.get(id_col, ""))
+                oname  = safe(r.get("report_name" if obj_type == "Report"
+                                    else "cube_name", ""))
+                fid    = safe(r.get("filter_id", ""))
+                fname  = safe(r.get("filter_name", ""))
+                fexpr  = safe(r.get("filter_expression", ""))
+                o_inf  = self._enrich_node(oid, pid)
+                self._edges.append(self._e(
+                    project_id=pid, project_name=pname,
+                    top_object_type=obj_type, top_object_id=oid,
+                    top_object_name=oname,
+                    edge_type=f"{obj_type}->Filter",
+                    parent_node_type=obj_type, parent_node_id=oid,
+                    parent_node_name=oname,
+                    child_node_type="Filter", child_node_id=fid,
+                    child_node_name=fname,
+                    node_level=2,
+                    filter_expression=fexpr,
+                    parent_folder=o_inf.get("folder",""),
+                    parent_owner=o_inf.get("owner",""),
+                ))
+
+    # -- Prompt edges (Report/Cube -> Prompt) ----------------------------------
+
+    def _prompt_edges(self):
+        for obj_type, id_col, br_key in [
+            ("Report", "report_id", "df_br_rpt_prompt"),
+            ("Cube",   "cube_id",   "df_br_cube_prompt"),
+        ]:
+            obj_df = self.dfs.get(f"df_{obj_type.lower()}s", pd.DataFrame())
+            br_df  = self.dfs.get(br_key, pd.DataFrame())
+            prm_df = self.dfs.get("df_prompts", pd.DataFrame())
+
+            if br_df.empty or prm_df.empty:
+                continue
+
+            merged = br_df.merge(prm_df, on=["project_id","prompt_id"], how="left")
+            if not obj_df.empty and id_col in obj_df.columns:
+                name_col = "report_name" if obj_type == "Report" else "cube_name"
+                merged = merged.merge(
+                    obj_df[["project_id", id_col, name_col]],
+                    on=["project_id", id_col], how="left")
+
+            for _, r in merged.iterrows():
+                pid   = r["project_id"]
+                pname = self._pname(pid)
+                oid   = safe(r.get(id_col, ""))
+                oname = safe(r.get("report_name" if obj_type == "Report"
+                                   else "cube_name", ""))
+                prid  = safe(r.get("prompt_id", ""))
+                prnam = safe(r.get("prompt_name", ""))
+                prtyp = safe(r.get("prompt_type", ""))
+                o_inf = self._enrich_node(oid, pid)
+                self._edges.append(self._e(
+                    project_id=pid, project_name=pname,
+                    top_object_type=obj_type, top_object_id=oid,
+                    top_object_name=oname,
+                    edge_type=f"{obj_type}->Prompt",
+                    parent_node_type=obj_type, parent_node_id=oid,
+                    parent_node_name=oname,
+                    child_node_type="Prompt", child_node_id=prid,
+                    child_node_name=prnam,
+                    node_level=2,
+                    prompt_type=prtyp,
+                    parent_folder=o_inf.get("folder",""),
+                    parent_owner=o_inf.get("owner",""),
+                ))
+
+    # -- Fact edges (Fact -> Column -> Table -> Datasource) --------------------
+
+    def _fact_edges(self):
+        step("PHASE 3", "Building fact lineage edges...")
+        facts = self.dfs["df_facts"]
+        if facts.empty:
+            return
+
+        for pid in facts["project_id"].unique():
             pname = self._pname(pid)
-            self._edges.append(self._e(
-                project_id=pid, project_name=pname,
-                top_object_type="Metric", top_object_id=m["metric_id"], top_object_name=m["metric_name"],
-                edge_type="Metric->Formula",
-                parent_node_type="Metric",       parent_node_id=m["metric_id"], parent_node_name=m["metric_name"],
-                child_node_type="MetricFormula", child_node_id=m["metric_id"],  child_node_name=f"{m['metric_name']} [Formula]",
-                node_level=1,
-                metric_formula=m.get("metric_formula",""),
-                metric_expression=m.get("metric_expression","")
-            ))
+            pf    = facts[facts["project_id"] == pid]
 
-    # -- Datasource topology edges ---------------------------------------------
+            for fid in pf["fact_id"].unique():
+                ff    = pf[pf["fact_id"] == fid]
+                fname = safe(ff["fact_name"].iloc[0])
+                f_inf = self._enrich_node(fid, pid)
 
-    def _datasource_topology_edges(self):
-        for _, ds in self.dfs["df_datasources"].iterrows():
+                for _, row in ff.iterrows():
+                    tbl_id   = safe(row.get("table_id", ""))
+                    tbl_name = safe(row.get("table_name", ""))
+                    col_name = safe(row.get("column_name", ""))
+                    ds_id    = self._tbl_ds(tbl_id, pid) if tbl_id else ""
+                    ds_inf   = self._ds(ds_id) if ds_id else {}
+
+                    self._edges.append(self._e(
+                        project_id=pid, project_name=pname,
+                        top_object_type="Fact", top_object_id=fid,
+                        top_object_name=fname,
+                        edge_type="Fact->Column",
+                        parent_node_type="Fact", parent_node_id=fid,
+                        parent_node_name=fname,
+                        child_node_type="Column", child_node_id="",
+                        child_node_name=col_name,
+                        node_level=1,
+                        fact_name=fname, fact_column=col_name,
+                        table_id=tbl_id, table_name=tbl_name,
+                        datasource_id=ds_id,
+                        db_instance_name=ds_inf.get("db_instance_name", ""),
+                        dsn_name=ds_inf.get("dsn_name", ""),
+                        db_type=ds_inf.get("db_type", ""),
+                        parent_folder=f_inf.get("folder", ""),
+                        parent_owner=f_inf.get("owner", ""),
+                    ))
+
+    # -- Datasource topology (DB Instance -> DSN -> Table -> Column) -----------
+
+    def _datasource_edges(self):
+        step("PHASE 3", "Building datasource topology edges...")
+        ds_df  = self.dfs["df_datasources"]
+        tbl_df = self.dfs["df_tables"]
+
+        if ds_df.empty:
+            return
+
+        for _, ds in ds_df.iterrows():
             did   = ds["datasource_id"]
-            dname = ds["db_instance_name"]
-            ds_info = self._ds_info(did)
+            dname = ds.get("db_instance_name", "")
+            dsn   = ds.get("dsn_name", "")
+            dbtyp = ds.get("db_type", "")
 
             self._edges.append(self._e(
                 project_id="__global__",
-                top_object_type="DBInstance", top_object_id=did, top_object_name=dname,
+                top_object_type="DBInstance", top_object_id=did,
+                top_object_name=dname,
                 edge_type="DBInstance->DSN",
-                parent_node_type="DBInstance", parent_node_id=did, parent_node_name=dname,
-                child_node_type="DSN",         child_node_id=did,  child_node_name=ds["dsn_name"],
+                parent_node_type="DBInstance", parent_node_id=did,
+                parent_node_name=dname,
+                child_node_type="DSN", child_node_id=did,
+                child_node_name=dsn,
                 node_level=1,
-                **ds_info
+                datasource_id=did, db_instance_name=dname,
+                dsn_name=dsn, db_type=dbtyp,
             ))
 
-            for _, t in self.dfs["df_tables"][self.dfs["df_tables"]["datasource_id"]==did].iterrows():
+            if tbl_df.empty:
+                continue
+
+            for _, t in tbl_df[tbl_df["datasource_id"] == did].iterrows():
                 tid   = t["table_id"]
                 tname = t["table_name"]
+                pid   = t["project_id"]
+
                 self._edges.append(self._e(
-                    project_id="__global__",
-                    top_object_type="DBInstance", top_object_id=did, top_object_name=dname,
+                    project_id=pid,
+                    top_object_type="DBInstance", top_object_id=did,
+                    top_object_name=dname,
                     edge_type="DSN->Table",
-                    parent_node_type="DSN",   parent_node_id=did, parent_node_name=ds["dsn_name"],
-                    child_node_type="Table",  child_node_id=tid,  child_node_name=tname,
+                    parent_node_type="DSN", parent_node_id=did,
+                    parent_node_name=dsn,
+                    child_node_type="Table", child_node_id=tid,
+                    child_node_name=tname,
                     node_level=2,
                     table_id=tid, table_name=tname,
-                    **ds_info
+                    datasource_id=did, db_instance_name=dname,
+                    dsn_name=dsn, db_type=dbtyp,
                 ))
-                for _, col in self._get_columns(tid, "__global__").iterrows():
+
+                for _, col in self._cols(tid, pid).iterrows():
                     self._edges.append(self._e(
-                        project_id="__global__",
-                        top_object_type="DBInstance", top_object_id=did, top_object_name=dname,
+                        project_id=pid,
+                        top_object_type="DBInstance", top_object_id=did,
+                        top_object_name=dname,
                         edge_type="Table->Column",
-                        parent_node_type="Table",  parent_node_id=tid, parent_node_name=tname,
-                        child_node_type="Column",  child_node_id="",   child_node_name=col["column_name"],
+                        parent_node_type="Table", parent_node_id=tid,
+                        parent_node_name=tname,
+                        child_node_type="Column", child_node_id="",
+                        child_node_name=col.get("column_name", ""),
                         node_level=3,
                         table_id=tid, table_name=tname,
-                        column_name=col["column_name"],
-                        column_data_type=col["column_data_type"],
-                        **ds_info
+                        column_name=col.get("column_name", ""),
+                        column_data_type=col.get("column_data_type", ""),
+                        datasource_id=did, db_instance_name=dname,
+                        dsn_name=dsn, db_type=dbtyp,
                     ))
 
-    # -- Build -----------------------------------------------------------------
+    def _cols(self, tbl_id: str, pid: str) -> pd.DataFrame:
+        df = self.dfs["df_columns"]
+        if df.empty:
+            return pd.DataFrame()
+        res = df[(df["table_id"] == tbl_id) & (df["project_id"] == pid)]
+        return res if not res.empty else df[df["table_id"] == tbl_id]
+
+    # -- Build final DataFrame -------------------------------------------------
+
+    def _resolve_ds(self, ds_id: str) -> tuple:
+        """Return (db_instance_name, dsn_name, db_type) for a datasource id."""
+        info = self._ds(ds_id)
+        return (info.get("db_instance_name",""),
+                info.get("dsn_name",""),
+                info.get("db_type",""))
+
+    def _flat_row(self, **kw) -> dict:
+        """Build one flat lineage row with all FINAL_COLS defaulted to blank."""
+        row = {c: "" for c in self.FINAL_COLS}
+        row["harvested_at"] = self.ts
+        row.update(kw)
+        return row
 
     def build(self) -> pd.DataFrame:
-        log.info("\n[PHASE 3] Joining DataFrames -> lineage edge DataFrame...")
+        """
+        Build the final FLAT lineage DataFrame.
+        One row = one lineage path from app to physical layer.
+        Same columns for schema and freeform -- freeform columns blank for schema,
+        attribute/metric columns blank for freeform.
+        """
+        rows = []
+        dfs  = self.dfs
 
-        self._report_edges()            # standard grid/graph reports
-        self._freeform_sql_edges()      # freeform SQL reports
-        self._cube_sourced_report_edges()  # OLAP / cube-sourced reports
-        self._cube_edges()
-        self._document_edges()
-        self._standalone_metric_edges()
-        self._datasource_topology_edges()
+        # -- helpers -----------------------------------------------------------
+        def pname(pid):
+            r = self.projects[self.projects["project_id"] == pid]
+            return r["project_name"].iloc[0] if not r.empty else pid
 
-        df = pd.DataFrame(self._edges)
+        def obj_info(oid, pid):
+            info = self._obj(oid, pid)
+            return info.get("folder_name",""), info.get("owner","")
 
-        # Ensure all columns present
+        def tbl_physical(tbl_id, pid):
+            """Return (table_name, datasource_id) for a table_id."""
+            tbls = dfs.get("df_tables", pd.DataFrame())
+            if tbls.empty:
+                return "", ""
+            r = tbls[(tbls["table_id"]==tbl_id)&(tbls["project_id"]==pid)]
+            if r.empty:
+                r = tbls[tbls["table_id"]==tbl_id]
+            if r.empty:
+                return "", ""
+            return safe(r["table_name"].iloc[0]), safe(r["datasource_id"].iloc[0])
+
+        def cols_for_table(tbl_id, pid):
+            return self._cols(tbl_id, pid)
+
+        # -- document -> dataset map -------------------------------------------
+        docs   = dfs.get("df_documents",  pd.DataFrame())
+        br_dd  = dfs.get("df_br_doc_ds",  pd.DataFrame())
+        # Build lookup: dataset_id -> (app_name, app_folder, app_owner, doc_subtype)
+        ds_to_app = {}
+        if not docs.empty and not br_dd.empty:
+            doc_map = docs.set_index(["project_id","doc_id"]).to_dict("index")
+            for _, br in br_dd.iterrows():
+                pid    = br["project_id"]
+                doc_id = br["doc_id"]
+                ds_id2 = br["dataset_id"]
+                key    = (pid, doc_id)
+                dinfo  = doc_map.get(key, {})
+                ds_to_app[(pid, ds_id2)] = {
+                    "app_name":    dinfo.get("doc_name",""),
+                    "app_folder":  "",
+                    "app_owner":   "",
+                    "doc_subtype": dinfo.get("doc_subtype",""),
+                }
+
+        def get_app(pid, dataset_id):
+            return ds_to_app.get((pid, dataset_id),
+                   {"app_name":"(No App)","app_folder":"","app_owner":"","doc_subtype":""})
+
+        # ====================================================================
+        # SCHEMA CUBES
+        # ====================================================================
+        cubes     = dfs.get("df_cubes",          pd.DataFrame())
+        br_cm     = dfs.get("df_br_cube_metric",  pd.DataFrame())
+        br_ca     = dfs.get("df_br_cube_attr",    pd.DataFrame())
+        metrics   = dfs.get("df_metrics",         pd.DataFrame())
+        attrs     = dfs.get("df_attributes",      pd.DataFrame())
+        attr_forms= dfs.get("df_attr_forms",      pd.DataFrame())
+
+        if not cubes.empty:
+            for _, cube in cubes.iterrows():
+                pid        = cube["project_id"]
+                cid        = cube["cube_id"]
+                cname      = safe(cube.get("cube_name",""))
+                src_type   = safe(cube.get("cube_source_type",""))
+                sql_prev   = safe(cube.get("sql_preview",""))
+                c_fold, c_own = obj_info(cid, pid)
+                app        = get_app(pid, cid)
+                pn         = pname(pid)
+
+                if src_type == "custom_sql_free_form":
+                    # -- FREEFORM CUBE -- one row per table in SQL
+                    tables_in_sql = extract_tables_from_sql(sql_prev)
+                    if not tables_in_sql:
+                        tables_in_sql = ["(tables not parsed)"]
+                    for tbl in tables_in_sql:
+                        # Try to find datasource from df_tables
+                        tbl_rows = dfs.get("df_tables", pd.DataFrame())
+                        ds_id3 = ""
+                        if not tbl_rows.empty:
+                            tr = tbl_rows[tbl_rows["table_name"].str.upper() == tbl.upper()]
+                            if not tr.empty:
+                                ds_id3 = tr["datasource_id"].iloc[0]
+                        db_inst, dsn, db_tp = self._resolve_ds(ds_id3)
+                        rows.append(self._flat_row(
+                            project_id=pid, project_name=pn,
+                            app_name=app["app_name"],
+                            app_folder=app["app_folder"],
+                            app_owner=app["app_owner"],
+                            dataset_name=cname,
+                            dataset_type="Freeform Cube",
+                            dataset_folder=c_fold,
+                            dataset_owner=c_own,
+                            object_type="FreeformSQL",
+                            sql_preview=sql_prev,
+                            table_name=tbl,
+                            db_instance_name=db_inst,
+                            dsn_name=dsn,
+                            db_type=db_tp,
+                            cube_source_type=src_type,
+                        ))
+                    continue
+
+                # -- SCHEMA CUBE -- metrics ------------------------------------
+                dataset_type = "Schema Cube"
+                if not br_cm.empty and "cube_id" in br_cm.columns:
+                    cm = br_cm[(br_cm["project_id"]==pid)&(br_cm["cube_id"]==cid)]
+                    cm = cm.merge(metrics, on=["project_id","metric_id"], how="left") if not cm.empty else pd.DataFrame()
+                    for _, m in cm.iterrows():
+                        mid   = safe(m.get("metric_id",""))
+                        mname = safe(m.get("metric_name",""))
+                        form  = safe(m.get("metric_formula",""))
+                        m_fold, m_own = obj_info(mid, pid)
+                        rows.append(self._flat_row(
+                            project_id=pid, project_name=pn,
+                            app_name=app["app_name"],
+                            app_folder=app["app_folder"],
+                            app_owner=app["app_owner"],
+                            dataset_name=cname,
+                            dataset_type=dataset_type,
+                            dataset_folder=c_fold,
+                            dataset_owner=c_own,
+                            object_type="Metric",
+                            object_name=mname,
+                            metric_formula=form,
+                            cube_source_type=src_type,
+                        ))
+
+                # -- SCHEMA CUBE -- attributes -> forms -> table -> columns ----
+                if not br_ca.empty and "cube_id" in br_ca.columns:
+                    ca = br_ca[(br_ca["project_id"]==pid)&(br_ca["cube_id"]==cid)]
+                    ca = ca.merge(attrs, on=["project_id","attribute_id"], how="left") if not ca.empty else pd.DataFrame()
+                    for _, a in ca.iterrows():
+                        aid   = safe(a.get("attribute_id",""))
+                        aname = safe(a.get("attribute_name",""))
+                        a_fold, a_own = obj_info(aid, pid)
+                        if not attr_forms.empty:
+                            af = attr_forms[(attr_forms["project_id"]==pid)&(attr_forms["attribute_id"]==aid)]
+                            for _, f in af.iterrows():
+                                tbl_id   = safe(f.get("table_id",""))
+                                tbl_name = safe(f.get("table_name",""))
+                                attr_col = safe(f.get("form_expression",""))
+                                ds_id3   = self._tbl_ds(tbl_id, pid) if tbl_id else ""
+                                db_inst, dsn, db_tp = self._resolve_ds(ds_id3)
+                                # One row per column in that table
+                                tcols = cols_for_table(tbl_id, pid)
+                                if not tcols.empty:
+                                    for _, col in tcols.iterrows():
+                                        rows.append(self._flat_row(
+                                            project_id=pid, project_name=pn,
+                                            app_name=app["app_name"],
+                                            app_folder=app["app_folder"],
+                                            app_owner=app["app_owner"],
+                                            dataset_name=cname,
+                                            dataset_type=dataset_type,
+                                            dataset_folder=c_fold,
+                                            dataset_owner=c_own,
+                                            object_type="Attribute",
+                                            object_name=aname,
+                                            attribute_column=attr_col,
+                                            table_name=tbl_name,
+                                            column_name=safe(col.get("column_name","")),
+                                            column_data_type=safe(col.get("column_data_type","")),
+                                            db_instance_name=db_inst,
+                                            dsn_name=dsn,
+                                            db_type=db_tp,
+                                            cube_source_type=src_type,
+                                        ))
+                                else:
+                                    rows.append(self._flat_row(
+                                        project_id=pid, project_name=pn,
+                                        app_name=app["app_name"],
+                                        app_folder=app["app_folder"],
+                                        app_owner=app["app_owner"],
+                                        dataset_name=cname,
+                                        dataset_type=dataset_type,
+                                        dataset_folder=c_fold,
+                                        dataset_owner=c_own,
+                                        object_type="Attribute",
+                                        object_name=aname,
+                                        attribute_column=attr_col,
+                                        table_name=tbl_name,
+                                        db_instance_name=db_inst,
+                                        dsn_name=dsn,
+                                        db_type=db_tp,
+                                        cube_source_type=src_type,
+                                    ))
+
+        # ====================================================================
+        # REPORTS (Grid + Freeform)
+        # ====================================================================
+        rpts   = dfs.get("df_reports",       pd.DataFrame())
+        br_rm  = dfs.get("df_br_rpt_metric", pd.DataFrame())
+        br_ra  = dfs.get("df_br_rpt_attr",   pd.DataFrame())
+        br_rf  = dfs.get("df_br_rpt_filter", pd.DataFrame())
+        br_rp  = dfs.get("df_br_rpt_prompt", pd.DataFrame())
+        filters= dfs.get("df_filters",       pd.DataFrame())
+        prompts= dfs.get("df_prompts",       pd.DataFrame())
+
+        if not rpts.empty:
+            for _, rpt in rpts.iterrows():
+                pid      = rpt["project_id"]
+                rid      = rpt["report_id"]
+                rname    = safe(rpt.get("report_name",""))
+                subtype  = safe(rpt.get("report_subtype",""))
+                sql_prev = safe(rpt.get("sql_preview",""))
+                r_fold, r_own = obj_info(rid, pid)
+                app      = get_app(pid, rid)
+                pn       = pname(pid)
+
+                # -- FREEFORM REPORT ------------------------------------------
+                if subtype == str(SUBTYPE_FREEFORM):
+                    tables_in_sql = extract_tables_from_sql(sql_prev)
+                    if not tables_in_sql:
+                        tables_in_sql = ["(tables not parsed)"]
+                    for tbl in tables_in_sql:
+                        tbl_rows = dfs.get("df_tables", pd.DataFrame())
+                        ds_id3 = ""
+                        if not tbl_rows.empty:
+                            tr = tbl_rows[tbl_rows["table_name"].str.upper() == tbl.upper()]
+                            if not tr.empty:
+                                ds_id3 = tr["datasource_id"].iloc[0]
+                        db_inst, dsn, db_tp = self._resolve_ds(ds_id3)
+                        rows.append(self._flat_row(
+                            project_id=pid, project_name=pn,
+                            app_name=app["app_name"],
+                            app_folder=app["app_folder"],
+                            app_owner=app["app_owner"],
+                            dataset_name=rname,
+                            dataset_type="Freeform Report",
+                            dataset_folder=r_fold,
+                            dataset_owner=r_own,
+                            object_type="FreeformSQL",
+                            sql_preview=sql_prev,
+                            table_name=tbl,
+                            db_instance_name=db_inst,
+                            dsn_name=dsn,
+                            db_type=db_tp,
+                            report_subtype=subtype,
+                        ))
+                    continue
+
+                dataset_type = "Grid Report"
+
+                # -- GRID REPORT -- metrics ------------------------------------
+                if not br_rm.empty and "report_id" in br_rm.columns:
+                    rm = br_rm[(br_rm["project_id"]==pid)&(br_rm["report_id"]==rid)]
+                    rm = rm.merge(metrics, on=["project_id","metric_id"], how="left") if not rm.empty else pd.DataFrame()
+                    for _, m in rm.iterrows():
+                        rows.append(self._flat_row(
+                            project_id=pid, project_name=pn,
+                            app_name=app["app_name"],
+                            app_folder=app["app_folder"],
+                            app_owner=app["app_owner"],
+                            dataset_name=rname,
+                            dataset_type=dataset_type,
+                            dataset_folder=r_fold,
+                            dataset_owner=r_own,
+                            object_type="Metric",
+                            object_name=safe(m.get("metric_name","")),
+                            metric_formula=safe(m.get("metric_formula","")),
+                            report_subtype=subtype,
+                        ))
+
+                # -- GRID REPORT -- attributes -> forms -> table -> columns ---
+                if not br_ra.empty and "report_id" in br_ra.columns:
+                    ra = br_ra[(br_ra["project_id"]==pid)&(br_ra["report_id"]==rid)]
+                    ra = ra.merge(attrs, on=["project_id","attribute_id"], how="left") if not ra.empty else pd.DataFrame()
+                    for _, a in ra.iterrows():
+                        aid   = safe(a.get("attribute_id",""))
+                        aname = safe(a.get("attribute_name",""))
+                        if not attr_forms.empty:
+                            af = attr_forms[(attr_forms["project_id"]==pid)&(attr_forms["attribute_id"]==aid)]
+                            for _, f in af.iterrows():
+                                tbl_id   = safe(f.get("table_id",""))
+                                tbl_name = safe(f.get("table_name",""))
+                                attr_col = safe(f.get("form_expression",""))
+                                ds_id3   = self._tbl_ds(tbl_id, pid) if tbl_id else ""
+                                db_inst, dsn, db_tp = self._resolve_ds(ds_id3)
+                                tcols = cols_for_table(tbl_id, pid)
+                                if not tcols.empty:
+                                    for _, col in tcols.iterrows():
+                                        rows.append(self._flat_row(
+                                            project_id=pid, project_name=pn,
+                                            app_name=app["app_name"],
+                                            app_folder=app["app_folder"],
+                                            app_owner=app["app_owner"],
+                                            dataset_name=rname,
+                                            dataset_type=dataset_type,
+                                            dataset_folder=r_fold,
+                                            dataset_owner=r_own,
+                                            object_type="Attribute",
+                                            object_name=aname,
+                                            attribute_column=attr_col,
+                                            table_name=tbl_name,
+                                            column_name=safe(col.get("column_name","")),
+                                            column_data_type=safe(col.get("column_data_type","")),
+                                            db_instance_name=db_inst,
+                                            dsn_name=dsn,
+                                            db_type=db_tp,
+                                            report_subtype=subtype,
+                                        ))
+                                else:
+                                    rows.append(self._flat_row(
+                                        project_id=pid, project_name=pn,
+                                        app_name=app["app_name"],
+                                        app_folder=app["app_folder"],
+                                        app_owner=app["app_owner"],
+                                        dataset_name=rname,
+                                        dataset_type=dataset_type,
+                                        dataset_folder=r_fold,
+                                        dataset_owner=r_own,
+                                        object_type="Attribute",
+                                        object_name=aname,
+                                        attribute_column=attr_col,
+                                        table_name=tbl_name,
+                                        db_instance_name=db_inst,
+                                        dsn_name=dsn,
+                                        db_type=db_tp,
+                                        report_subtype=subtype,
+                                    ))
+
+                # -- GRID REPORT -- filters ------------------------------------
+                if not br_rf.empty and "report_id" in br_rf.columns and not filters.empty:
+                    rf = br_rf[(br_rf["project_id"]==pid)&(br_rf["report_id"]==rid)]
+                    rf = rf.merge(filters, on=["project_id","filter_id"], how="left") if not rf.empty else pd.DataFrame()
+                    for _, flt in rf.iterrows():
+                        rows.append(self._flat_row(
+                            project_id=pid, project_name=pn,
+                            app_name=app["app_name"],
+                            app_folder=app["app_folder"],
+                            app_owner=app["app_owner"],
+                            dataset_name=rname,
+                            dataset_type=dataset_type,
+                            dataset_folder=r_fold,
+                            dataset_owner=r_own,
+                            object_type="Filter",
+                            object_name=safe(flt.get("filter_name","")),
+                            filter_expression=safe(flt.get("filter_expression","")),
+                            report_subtype=subtype,
+                        ))
+
+                # -- GRID REPORT -- prompts ------------------------------------
+                if not br_rp.empty and "report_id" in br_rp.columns and not prompts.empty:
+                    rp = br_rp[(br_rp["project_id"]==pid)&(br_rp["report_id"]==rid)]
+                    rp = rp.merge(prompts, on=["project_id","prompt_id"], how="left") if not rp.empty else pd.DataFrame()
+                    for _, prm in rp.iterrows():
+                        rows.append(self._flat_row(
+                            project_id=pid, project_name=pn,
+                            app_name=app["app_name"],
+                            app_folder=app["app_folder"],
+                            app_owner=app["app_owner"],
+                            dataset_name=rname,
+                            dataset_type=dataset_type,
+                            dataset_folder=r_fold,
+                            dataset_owner=r_own,
+                            object_type="Prompt",
+                            object_name=safe(prm.get("prompt_name","")),
+                            prompt_type=safe(prm.get("prompt_type","")),
+                            report_subtype=subtype,
+                        ))
+
+        # ====================================================================
+        # BUILD FINAL DATAFRAME
+        # ====================================================================
+        df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=self.FINAL_COLS)
+
         for col in self.FINAL_COLS:
             if col not in df.columns:
                 df[col] = ""
@@ -1194,226 +2070,173 @@ class LineageJoiner:
         df = df[self.FINAL_COLS].copy()
         df["lineage_row_id"] = [str(i+1).zfill(8) for i in range(len(df))]
         df["harvested_at"]   = self.ts
-        df["node_level"]     = pd.to_numeric(df["node_level"], errors="coerce").fillna(0).astype(int)
 
-        str_cols = [c for c in df.columns if c != "node_level"]
+        str_cols = [c for c in df.columns]
         df[str_cols] = df[str_cols].fillna("").astype(str).apply(lambda s: s.str.strip())
-
         df = df.drop_duplicates().reset_index(drop=True)
-        log.info(f"  -> Final lineage DataFrame: {len(df):,} edge rows across {df['edge_type'].nunique()} edge types")
-        log.info(f"  -> Edge type breakdown:")
-        for et, cnt in df["edge_type"].value_counts().items():
-            log.info(f"       {et:<35}: {cnt:>7,}")
+
+        step("PHASE 3", f"Final flat lineage DataFrame: {len(df):,} rows")
+        if not df.empty and "dataset_type" in df.columns:
+            for dt, cnt in df["dataset_type"].value_counts().items():
+                log.info(f"    {dt:<30}: {cnt:>6,} rows")
         return df
 
 
-# -----------------------------------------------------------------------------
-# PHASE 4 -- PUBLISH AS INTELLIGENT CUBE (Push Data API)
-# -----------------------------------------------------------------------------
-
+# =============================================================================
+# PHASE 4 -- CUBE PUBLISHER (Push Data API)
+# =============================================================================
 class CubePublisher:
     """
-    Publishes df_lineage as an Intelligent Cube via the MSTR Push Data API.
+    Publishes df_lineage as an Intelligent Cube on the dev server.
 
-    Flow:
-      POST /api/datasets                                     -> create definition
-      PUT  /api/datasets/{id}/tables/{table}  (chunked)     -> upload rows
-      POST /api/datasets/{id}/publish                        -> publish
+    Update-or-create:
+      Run 1 (cube does not exist):
+        POST /api/datasets                               create definition
+        PUT  /api/datasets/{id}/uploadSessions/{sid}/tables/{t}
+        POST /api/datasets/{id}/uploadSessions/{sid}/publish
+
+      Run 2+ (cube exists):
+        POST /api/datasets/{id}/uploadSessions           open new session
+        PUT  ...uploadSessions/{new_sid}/tables/{t}      upload (Replace+Add)
+        POST ...uploadSessions/{new_sid}/publish         commit
     """
 
     METRIC_COL = "node_level"
-    CHUNK_SIZE  = 50_000
 
     def __init__(self, client: MSTRClient, project_id: str,
                  cube_name: str, table_name: str, folder_id: str = ""):
-        self.c          = client
-        self.project_id = project_id
-        self.cube_name  = cube_name
-        self.table_name = table_name
-        self.folder_id  = folder_id
+        self.c    = client
+        self.pid  = project_id
+        self.name = cube_name
+        self.tbl  = table_name
+        self.fid  = folder_id
 
     def _attr_cols(self, df: pd.DataFrame) -> list:
         return [c for c in df.columns if c != self.METRIC_COL]
 
-    def _find_existing_cube(self) -> str:
-        """
-        Search the dev project for a cube whose name exactly matches CUBE_NAME.
-        Returns the dataset ID if found, empty string if not found.
-        Every run uses this to decide UPDATE vs CREATE - no duplicate cubes.
-        """
-        data = self.c.get(
-            "/searches/results", pid=self.project_id,
-            params={"type": TYPE_CUBE, "name": self.cube_name, "limit": 50}
-        )
+    def _find_existing(self) -> str:
+        data = self.c.get("/searches/results", pid=self.pid,
+                          params={"type": TYPE_CUBE, "name": self.name,
+                                  "limit": 50})
         for obj in data.get("result", []):
-            if safe(obj.get("name")) == self.cube_name:
-                existing_id = safe(obj.get("id"))
-                log.info(f"  [FOUND] Existing cube '{self.cube_name}' -> ID: {existing_id}  (will UPDATE)")
-                return existing_id
-        log.info(f"  [NOT FOUND] Cube '{self.cube_name}' does not exist yet  (will CREATE)")
+            if safe(obj.get("name")) == self.name:
+                eid = safe(obj.get("id"))
+                log.info(f"  [FOUND] Existing cube {eid} -> will UPDATE")
+                return eid
+        log.info("  [NOT FOUND] Will CREATE new cube")
         return ""
 
-    def _definition_body(self, df: pd.DataFrame) -> dict:
-        attr_cols = self._attr_cols(df)
-        all_cols  = attr_cols + [self.METRIC_COL]
+    def _definition(self, df: pd.DataFrame) -> dict:
+        ac  = self._attr_cols(df)
+        all = ac + [self.METRIC_COL]
         body = {
-            "name":   self.cube_name,
-            "tables": [{"name": self.table_name, "columnHeaders": all_cols}],
+            "name":   self.name,
+            "tables": [{"name": self.tbl, "columnHeaders": all}],
             "attributes": [
-                {
-                    "name": col,
-                    "attributeForms": [{
-                        "category": "ID",
-                        "expressions": [{"formula": f"{self.table_name}.{col}"}]
-                    }]
-                }
-                for col in attr_cols
+                {"name": c, "attributeForms": [{
+                    "category": "ID",
+                    "expressions": [{"formula": f"{self.tbl}.{c}"}]
+                }]}
+                for c in ac
             ],
             "metrics": [{
                 "name": "Node Level",
                 "dataType": "integer",
-                "expressions": [{"formula": f"{self.table_name}.{self.METRIC_COL}"}]
+                "expressions": [{"formula": f"{self.tbl}.{self.METRIC_COL}"}]
             }]
         }
-        if self.folder_id:
-            body["folderId"] = self.folder_id
+        if self.fid:
+            body["folderId"] = self.fid
         return body
 
-    def _serialize(self, df_chunk: pd.DataFrame, policy: str = "Replace") -> dict:
-        attr_cols = self._attr_cols(df_chunk)
-        all_cols  = attr_cols + [self.METRIC_COL]
-        headers   = {col: idx for idx, col in enumerate(all_cols)}
-        raw_data  = []
-        for _, row in df_chunk.iterrows():
-            record = [str(row.get(c,"") or "") for c in attr_cols]
-            record.append(str(int(row.get(self.METRIC_COL, 0) or 0)))
-            raw_data.append(record)
-        return {"data": {"headers": headers, "rawData": raw_data}, "updatePolicy": policy}
+    def _serialize(self, chunk: pd.DataFrame, policy: str) -> dict:
+        ac   = self._attr_cols(chunk)
+        all  = ac + [self.METRIC_COL]
+        hdrs = {c: i for i, c in enumerate(all)}
+        rows = []
+        for _, r in chunk.iterrows():
+            rec = [str(r.get(c, "") or "") for c in ac]
+            rec.append(str(int(r.get(self.METRIC_COL, 0) or 0)))
+            rows.append(rec)
+        return {"data": {"headers": hdrs, "rawData": rows},
+                "updatePolicy": policy}
 
-    def _open_upload_session(self, dataset_id: str) -> str:
-        """
-        Create a new upload session against an existing cube.
-        Required by MSTR Push Data API before any PUT upload call.
-        Returns the uploadSessionId.
-        """
-        resp = self.c.post(
-            f"/datasets/{dataset_id}/uploadSessions",
-            body={"uploadSessionType": "normalUpload"},
-            pid=self.project_id
-        )
-        session_id = resp.get("uploadSessionId", "")
-        if not session_id:
-            raise RuntimeError(
-                f"Failed to open upload session for dataset {dataset_id}. Response: {resp}"
-            )
-        log.info(f"  [SESSION] Upload session opened: {session_id}")
-        return session_id
+    def _open_session(self, dataset_id: str) -> str:
+        resp = self.c.post(f"/datasets/{dataset_id}/uploadSessions",
+                           body={"uploadSessionType": "normalUpload"},
+                           pid=self.pid)
+        sid = resp.get("uploadSessionId", "")
+        if not sid:
+            raise RuntimeError(f"Failed to open upload session: {resp}")
+        log.info(f"  [SESSION] {sid}")
+        return sid
 
-    def _upload_chunks(self, dataset_id: str, session_id: str, df: pd.DataFrame):
-        """
-        Chunk-upload all rows into an open upload session.
-        First chunk uses Replace (truncates existing data), subsequent chunks use Add.
-        """
-        chunks = [df.iloc[i:i+self.CHUNK_SIZE] for i in range(0, len(df), self.CHUNK_SIZE)]
+    def _upload(self, dataset_id: str, sid: str, df: pd.DataFrame):
+        chunks = [df.iloc[i:i + CHUNK_SIZE]
+                  for i in range(0, len(df), CHUNK_SIZE)]
         for idx, chunk in enumerate(chunks):
             policy = "Replace" if idx == 0 else "Add"
-            log.info(f"  [UPLOAD] Chunk {idx+1}/{len(chunks)} ({len(chunk):,} rows)  policy={policy}")
+            log.info(f"  [UPLOAD] Chunk {idx+1}/{len(chunks)} "
+                     f"({len(chunk):,} rows) policy={policy}")
             self.c.put(
-                f"/datasets/{dataset_id}/uploadSessions/{session_id}/tables/{self.table_name}",
+                f"/datasets/{dataset_id}/uploadSessions/{sid}/tables/{self.tbl}",
                 body=self._serialize(chunk, policy),
-                pid=self.project_id
-            )
+                pid=self.pid)
 
-    def _publish_session(self, dataset_id: str, session_id: str):
-        """Commit the upload session -- makes data visible in the cube."""
-        pub = self.c.post(
-            f"/datasets/{dataset_id}/uploadSessions/{session_id}/publish",
-            body={},
-            pid=self.project_id
-        )
-        log.info(f"  [PUBLISH] Committed session {session_id}  response: {pub}")
+    def _publish(self, dataset_id: str, sid: str):
+        resp = self.c.post(
+            f"/datasets/{dataset_id}/uploadSessions/{sid}/publish",
+            body={}, pid=self.pid)
+        log.info(f"  [PUBLISH] {resp}")
 
     def publish(self, df: pd.DataFrame) -> str:
-        """
-        Update-or-create -- same fixed cube name every run, zero duplicates.
-
-        Run 1  (cube does not exist yet):
-          POST /api/datasets                                          create definition
-          -> returns datasetId + uploadSessionId
-          PUT  /api/datasets/{id}/uploadSessions/{sid}/tables/{t}    upload rows
-          POST /api/datasets/{id}/uploadSessions/{sid}/publish        publish
-
-        Run 2+ (cube already exists):
-          POST /api/datasets/{id}/uploadSessions                      open NEW session
-          -> returns fresh uploadSessionId
-          PUT  /api/datasets/{id}/uploadSessions/{sid}/tables/{t}    upload rows (Replace then Add)
-          POST /api/datasets/{id}/uploadSessions/{sid}/publish        publish / commit
-
-        The Replace policy on the first chunk truncates all previous data before
-        loading the new full set -- so old projects drop out, new projects appear,
-        and you always get a clean current snapshot.
-        """
         if df.empty:
             raise ValueError("No lineage rows to publish.")
 
-        log.info(f"\n[PHASE 4] Update-or-create: '{self.cube_name}'")
-        log.info(f"  Target : {self.c.base_url}")
-        log.info(f"  Project: {self.project_id}")
-        log.info(f"  Rows   : {len(df):,}")
+        step("PHASE 4", f"Update-or-create cube '{self.name}'")
+        log.info(f"  Target  : {self.c.base_url}")
+        log.info(f"  Project : {self.pid}")
+        log.info(f"  Rows    : {len(df):,}")
 
-        existing_id = self._find_existing_cube()
+        existing = self._find_existing()
 
-        if existing_id:
-            # -- UPDATE path ---------------------------------------------------
-            # Cube exists: open a new upload session, upload, publish.
-            # The Replace policy on chunk 0 clears the old data first.
-            log.info(f"  [MODE] UPDATE -- opening upload session on existing cube {existing_id}")
-            session_id = self._open_upload_session(existing_id)
-            self._upload_chunks(existing_id, session_id, df)
-            self._publish_session(existing_id, session_id)
-            log.info(f"\n  Cube UPDATED -> ID: {existing_id} | Name: {self.cube_name}")
-            return existing_id
-
+        if existing:
+            sid = self._open_session(existing)
+            self._upload(existing, sid, df)
+            self._publish(existing, sid)
+            log.info(f"  Cube UPDATED -> {existing}")
+            return existing
         else:
-            # -- CREATE path ---------------------------------------------------
-            # First run: POST /api/datasets returns both datasetId and uploadSessionId
-            # in one call -- no separate session open needed.
-            log.info("  [MODE] CREATE -- posting dataset definition")
-            resp = self.c.post(
-                "/datasets",
-                body=self._definition_body(df),
-                pid=self.project_id
-            )
+            resp = self.c.post("/datasets", body=self._definition(df),
+                               pid=self.pid)
             dataset_id = resp.get("datasetId") or resp.get("id", "")
-            session_id = resp.get("uploadSessionId", "")
+            sid        = resp.get("uploadSessionId", "")
             if not dataset_id:
-                raise RuntimeError(f"Dataset creation failed. Response: {resp}")
-            if not session_id:
-                # Some MSTR versions require a separate session open even on create
-                log.info("  [SESSION] uploadSessionId not in create response -- opening session explicitly")
-                session_id = self._open_upload_session(dataset_id)
-            log.info(f"  [CREATE] Dataset ID: {dataset_id}  Session: {session_id}")
-            self._upload_chunks(dataset_id, session_id, df)
-            self._publish_session(dataset_id, session_id)
-            log.info(f"\n  Cube CREATED -> ID: {dataset_id} | Name: {self.cube_name}")
+                raise RuntimeError(f"Dataset creation failed: {resp}")
+            if not sid:
+                sid = self._open_session(dataset_id)
+            log.info(f"  [CREATE] Dataset {dataset_id} Session {sid}")
+            self._upload(dataset_id, sid, df)
+            self._publish(dataset_id, sid)
+            log.info(f"  Cube CREATED -> {dataset_id}")
             return dataset_id
 
-# -----------------------------------------------------------------------------
-# MAIN
-# -----------------------------------------------------------------------------
 
+# =============================================================================
+# MAIN
+# =============================================================================
 def main():
     run_ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-    tracker = ProgressTracker(total_steps=4, label="MSTR Lineage Harvester")
+    t_start = datetime.now()
 
-    print("=" * 70)
-    print("  MSTR FULL-CHAIN LINEAGE HARVESTER  v2.0.0")
+    print("=" * 65)
+    print("  MSTR FULL-CHAIN LINEAGE HARVESTER  v3.0.0")
     print(f"  Run        : {run_ts}")
     print(f"  Source     : {SOURCE_BASE_URL}")
     print(f"  Target     : {TARGET_BASE_URL}")
-    print(f"  Project(s) : {RUN_ONLY_PROJECT_IDS if RUN_ONLY_PROJECT_IDS else 'ALL'}")
+    print(f"  Projects   : {RUN_ONLY_PROJECT_IDS if RUN_ONLY_PROJECT_IDS else 'ALL'}")
     print(f"  Cube       : {CUBE_NAME}  (update-or-create)")
-    print("=" * 70)
+    print("=" * 65)
 
     src = MSTRClient(SOURCE_BASE_URL, MSTR_USERNAME, MSTR_PASSWORD)
     src.login()
@@ -1421,69 +2244,54 @@ def main():
     df_lineage = pd.DataFrame()
 
     try:
-        # -- Phase 1: Project discovery -------------------------------------
-        tracker.step("Phase 1 of 4 -- Discovering projects")
+        # Phase 1
         df_projects = discover_projects(src, RUN_ONLY_PROJECT_IDS)
         if df_projects.empty:
-            log.error("No projects found. Exiting.")
+            log.error("No projects found. Check RUN_ONLY_PROJECT_IDS or credentials.")
             return
-        tracker.item(f"{len(df_projects)} project(s) ready to harvest")
 
-        # -- Phase 2: Harvest all projects into normalized DFs --------------
-        tracker.step("Phase 2 of 4 -- Harvesting metadata from production")
+        # Phase 2
+        step("PHASE 2", "Harvesting metadata from production...")
         engine = HarvestEngine(src)
-
-        tracker.item("Loading datasources...")
         engine.harvest_datasources()
 
-        total_projects = len(df_projects)
-        for idx, (_, proj) in enumerate(df_projects.iterrows(), 1):
+        n = len(df_projects)
+        for i, (_, proj) in enumerate(df_projects.iterrows(), 1):
             pid   = proj["project_id"]
             pname = proj["project_name"]
-            tracker.item(f"Project {idx}/{total_projects}: {pname}")
+            step("PHASE 2", f"Project {i}/{n}: {pname}")
             engine.harvest_project(pid, pname)
 
-        tracker.item("Fetching datasource table topology...")
-        engine.harvest_datasource_topology()
-
-        tracker.item("Building normalized DataFrames...")
         dfs = engine.build_dataframes()
 
-        # -- Phase 3: Join chain -> final lineage DataFrame -----------------
-        tracker.step("Phase 3 of 4 -- Joining DataFrames into lineage edges")
+        # Phase 3
+        step("PHASE 3", "Joining DataFrames -> lineage edges...")
         joiner     = LineageJoiner(dfs, df_projects)
         df_lineage = joiner.build()
-        tracker.item(f"{len(df_lineage):,} lineage edges built")
-        tracker.item(f"Edge types: {df_lineage['edge_type'].nunique()} distinct types")
 
-        # Sample preview
-        print("\n  Sample lineage edges:")
-        print(df_lineage[["edge_type","parent_node_name","child_node_name","node_level"]]
+        print("\n  Sample edges (edge_type | parent | child | level):")
+        print(df_lineage[["edge_type", "parent_node_name",
+                           "child_node_name", "node_level"]]
               .head(10).to_string(index=False))
 
     finally:
         src.logout()
-        log.info("[AUTH] Production server disconnected")
 
-    # -- Phase 4: Publish cube to dev server -------------------------------
-    tracker.step("Phase 4 of 4 -- Publishing lineage cube to dev server")
+    # Phase 4
     tgt = MSTRClient(TARGET_BASE_URL, MSTR_USERNAME, MSTR_PASSWORD)
     tgt.login()
     try:
-        publisher = CubePublisher(
-            client=tgt,
-            project_id=TARGET_PROJECT_ID,
-            cube_name=CUBE_NAME,
-            table_name=TABLE_NAME,
-            folder_id=TARGET_FOLDER_ID
-        )
-        dataset_id = publisher.publish(df_lineage)
-        tracker.item(f"Cube ID: {dataset_id}")
+        pub = CubePublisher(tgt, TARGET_PROJECT_ID, CUBE_NAME,
+                            TABLE_NAME, TARGET_FOLDER_ID)
+        dataset_id = pub.publish(df_lineage)
+        step("PHASE 4", f"Cube ID: {dataset_id}")
     finally:
         tgt.logout()
-        log.info("[AUTH] Dev server disconnected")
 
-    tracker.done(total_rows=len(df_lineage))
+    elapsed = (datetime.now() - t_start).seconds
+    print("\n" + "=" * 65)
+    print(f"  COMPLETE  |  {len(df_lineage):,} lineage edges  |  {elapsed}s")
+    print("=" * 65)
 
 
 if __name__ == "__main__":
