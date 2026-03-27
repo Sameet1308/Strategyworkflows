@@ -46,23 +46,23 @@ SOURCE_BASE_URL = “https://YOUR_PROD_SERVER/MicroStrategyLibrarySTD”
 
 # ── Project scope ─────────────────────────────────────────────────────────────
 
-# Option A — Targeted / test run (start here):
+# Add one or more project IDs below to harvest only those projects.
 
-# Paste one or more PRODUCTION project IDs. Only those projects are harvested.
+# Leave the list empty [] to automatically harvest ALL projects in the environment.
 
-# Leave the list empty [] to switch to Option B (full run).
+# 
+
+# Example — test with one project first:
+
+# RUN_ONLY_PROJECT_IDS = [“XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX”]
+
+# 
+
+# Example — full run across everything:
+
+# RUN_ONLY_PROJECT_IDS = []
 
 RUN_ONLY_PROJECT_IDS = [
-# “XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX”,   # paste your first test project ID
-]
-
-# Option B — Full run across all projects:
-
-# Used automatically when RUN_ONLY_PROJECT_IDS = [].
-
-# Add any project IDs you want to SKIP (tutorial / system projects, etc.).
-
-EXCLUDE_PROJECT_IDS = [
 # “XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX”,
 ]
 
@@ -136,6 +136,74 @@ format=”%(asctime)s [%(levelname)s] %(message)s”,
 datefmt=”%Y-%m-%d %H:%M:%S”
 )
 log = logging.getLogger(“lineage”)
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+# PROGRESS TRACKER
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ProgressTracker:
+“””
+Lightweight progress tracker. Prints a visible status bar to the console
+so you can see exactly where the script is at all times.
+
+```
+Usage:
+    tracker = ProgressTracker(total_steps=5)
+    tracker.step("Discovering projects")
+    tracker.step("Harvesting reports")
+    tracker.done()
+"""
+
+def __init__(self, total_steps: int = 0, label: str = ""):
+    self.total   = total_steps
+    self.current = 0
+    self.label   = label
+    self.start   = datetime.now()
+
+def step(self, message: str, current: int = None, total: int = None):
+    if current is not None:
+        self.current = current
+    else:
+        self.current += 1
+    if total is not None:
+        self.total = total
+
+    elapsed = (datetime.now() - self.start).seconds
+    if self.total > 0:
+        pct   = int((self.current / self.total) * 100)
+        bar   = ("=" * (pct // 5)).ljust(20)
+        label = f"[{bar}] {pct:3d}%  step {self.current}/{self.total}"
+    else:
+        label = f"[step {self.current}]"
+
+    sep = "=" * 70
+    print(f"\n{sep}")
+    print(f"  {self.label + ' | ' if self.label else ''}{message}")
+    print(f"  {label}  |  elapsed: {elapsed}s")
+    print(sep)
+    log.info(f"[PROGRESS] {message}")
+
+def item(self, message: str):
+    """Log a sub-item within a step — visible but less prominent."""
+    log.info(f"  --> {message}")
+
+def done(self, total_rows: int = 0):
+    elapsed = (datetime.now() - self.start).seconds
+    sep = "=" * 70
+    print(f"\n{sep}")
+    print(f"  COMPLETE{' | ' + self.label if self.label else ''}")
+    if total_rows:
+        print(f"  Total lineage edges: {total_rows:,}")
+    print(f"  Total elapsed      : {elapsed}s")
+    print(f"{sep}\n")
+```
+
+def progress(phase: str, message: str):
+“”“Simple one-liner progress log — used outside tracker context.”””
+print(f”\n  [{phase}] {message}”)
+log.info(f”[{phase}] {message}”)
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -266,36 +334,31 @@ def get_datasources(self) -> list:
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-def discover_projects(client: MSTRClient,
-run_only_ids: list,
-exclude_ids: list) -> pd.DataFrame:
-log.info(”\n[PHASE 1] Discovering projects…”)
-if run_only_ids:
-log.info(f”  [MODE] Targeted run – {len(run_only_ids)} specific project(s)”)
-else:
-log.info(”  [MODE] Auto-discover ALL projects (exclusion list applied)”)
+def discover_projects(client: MSTRClient, run_only_ids: list) -> pd.DataFrame:
+progress(“PHASE 1”, “Discovering projects…”)
+all_projects = client.get_projects()
 
 ```
+if run_only_ids:
+    progress("PHASE 1", f"Targeted run -- {len(run_only_ids)} project(s) specified")
+else:
+    progress("PHASE 1", f"Full run -- harvesting all {len(all_projects)} project(s) found")
+
 rows = []
-for p in client.get_projects():
+for p in all_projects:
     pid    = safe(p.get("id"))
     name   = safe(p.get("name"))
-    status = safe(p.get("status",""))
+    status = safe(p.get("status", ""))
 
-    if run_only_ids:
-        if pid not in run_only_ids:
-            log.info(f"  [SKIP] {name} ({pid})")
-            continue
-    else:
-        if pid in exclude_ids:
-            log.info(f"  [EXCLUDED] {name} ({pid})")
-            continue
+    if run_only_ids and pid not in run_only_ids:
+        log.debug(f"  [SKIP] {name} ({pid})")
+        continue
 
     rows.append({"project_id": pid, "project_name": name, "project_status": status})
     log.info(f"  [QUEUED] {name} ({pid})")
 
-df = pd.DataFrame(rows)
-log.info(f"  -> {len(df)} project(s) queued for harvest")
+df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["project_id","project_name","project_status"])
+progress("PHASE 1", f"{len(df)} project(s) queued for harvest")
 return df
 ```
 
@@ -689,12 +752,24 @@ def harvest_datasource_topology(self):
 # ── Per-project orchestrator ──────────────────────────────────────────────
 
 def harvest_project(self, pid: str, pname: str):
+    print(f"\n    Project : {pname}")
+    print(f"    ID      : {pid}")
+    print(f"    {'─'*55}")
     log.info(f"\n  == Project: {pname} ({pid}) ==")
     self.harvest_reports(pid, pname)
     self.harvest_cubes(pid, pname)
     self.harvest_documents(pid, pname)
     self.harvest_standalone_metrics(pid, pname)
     self.harvest_standalone_attributes(pid, pname)
+    rpt_count  = sum(1 for r in self._reports   if r["project_id"] == pid)
+    cube_count = sum(1 for c in self._cubes      if c["project_id"] == pid)
+    doc_count  = sum(1 for d in self._documents  if d["project_id"] == pid)
+    met_count  = sum(1 for m in self._metrics    if m["project_id"] == pid)
+    attr_count = sum(1 for a in self._attributes if a["project_id"] == pid)
+    ff_count   = sum(1 for f in self._freeform_sqls if f["project_id"] == pid)
+    cs_count   = sum(1 for c in self._cube_sourced_reports if c["project_id"] == pid)
+    print(f"    Reports (grid/graph): {rpt_count - ff_count - cs_count}  |  Freeform SQL: {ff_count}  |  Cube-sourced: {cs_count}")
+    print(f"    Cubes: {cube_count}  |  Docs/Dossiers: {doc_count}  |  Metrics: {met_count}  |  Attributes: {attr_count}")
 
 # ── Build DataFrames ──────────────────────────────────────────────────────
 
@@ -1379,50 +1454,71 @@ def publish(self, df: pd.DataFrame) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-run_ts = datetime.now().strftime(”%Y%m%d_%H%M%S”)
+run_ts  = datetime.now().strftime(”%Y%m%d_%H%M%S”)
+tracker = ProgressTracker(total_steps=4, label=“MSTR Lineage Harvester”)
 
 ```
-log.info("=" * 70)
-log.info("MSTR FULL-CHAIN LINEAGE HARVESTER  v2.0.0")
-log.info(f"Run timestamp : {run_ts}")
-log.info(f"Source server : {SOURCE_BASE_URL}")
-log.info(f"Target server : {TARGET_BASE_URL}")
-log.info(f"Target project: {TARGET_PROJECT_ID}")
-log.info(f"Cube name     : {CUBE_NAME}  (update-or-create)")
-log.info("=" * 70)
+print("=" * 70)
+print("  MSTR FULL-CHAIN LINEAGE HARVESTER  v2.0.0")
+print(f"  Run        : {run_ts}")
+print(f"  Source     : {SOURCE_BASE_URL}")
+print(f"  Target     : {TARGET_BASE_URL}")
+print(f"  Project(s) : {RUN_ONLY_PROJECT_IDS if RUN_ONLY_PROJECT_IDS else 'ALL'}")
+print(f"  Cube       : {CUBE_NAME}  (update-or-create)")
+print("=" * 70)
 
 src = MSTRClient(SOURCE_BASE_URL, MSTR_USERNAME, MSTR_PASSWORD)
 src.login()
 
+df_lineage = pd.DataFrame()
+
 try:
-    # Phase 1: Project discovery
-    df_projects = discover_projects(src, RUN_ONLY_PROJECT_IDS, EXCLUDE_PROJECT_IDS)
+    # ── Phase 1: Project discovery ─────────────────────────────────────
+    tracker.step("Phase 1 of 4 — Discovering projects")
+    df_projects = discover_projects(src, RUN_ONLY_PROJECT_IDS)
     if df_projects.empty:
         log.error("No projects found. Exiting.")
         return
+    tracker.item(f"{len(df_projects)} project(s) ready to harvest")
 
-    # Phase 2: Harvest all projects into normalized DFs
-    log.info("\n[PHASE 2] Harvesting...")
+    # ── Phase 2: Harvest all projects into normalized DFs ──────────────
+    tracker.step("Phase 2 of 4 — Harvesting metadata from production")
     engine = HarvestEngine(src)
+
+    tracker.item("Loading datasources...")
     engine.harvest_datasources()
-    for _, proj in df_projects.iterrows():
-        engine.harvest_project(proj["project_id"], proj["project_name"])
+
+    total_projects = len(df_projects)
+    for idx, (_, proj) in enumerate(df_projects.iterrows(), 1):
+        pid   = proj["project_id"]
+        pname = proj["project_name"]
+        tracker.item(f"Project {idx}/{total_projects}: {pname}")
+        engine.harvest_project(pid, pname)
+
+    tracker.item("Fetching datasource table topology...")
     engine.harvest_datasource_topology()
+
+    tracker.item("Building normalized DataFrames...")
     dfs = engine.build_dataframes()
 
-    # Phase 3: Join -> final lineage DF
+    # ── Phase 3: Join chain -> final lineage DataFrame ─────────────────
+    tracker.step("Phase 3 of 4 — Joining DataFrames into lineage edges")
     joiner     = LineageJoiner(dfs, df_projects)
     df_lineage = joiner.build()
+    tracker.item(f"{len(df_lineage):,} lineage edges built")
+    tracker.item(f"Edge types: {df_lineage['edge_type'].nunique()} distinct types")
 
-    # Print preview
-    log.info("\nSample rows (edge_type | parent | child | level):")
+    # Sample preview
+    print("\n  Sample lineage edges:")
     print(df_lineage[["edge_type","parent_node_name","child_node_name","node_level"]]
-          .head(20).to_string(index=False))
+          .head(10).to_string(index=False))
 
 finally:
     src.logout()
+    log.info("[AUTH] Production server disconnected")
 
-# Phase 4: Publish cube to dev server
+# ── Phase 4: Publish cube to dev server ───────────────────────────────
+tracker.step("Phase 4 of 4 — Publishing lineage cube to dev server")
 tgt = MSTRClient(TARGET_BASE_URL, MSTR_USERNAME, MSTR_PASSWORD)
 tgt.login()
 try:
@@ -1434,13 +1530,12 @@ try:
         folder_id=TARGET_FOLDER_ID
     )
     dataset_id = publisher.publish(df_lineage)
-    log.info(f"\n[DONE] Cube ID: {dataset_id}")
+    tracker.item(f"Cube ID: {dataset_id}")
 finally:
     tgt.logout()
+    log.info("[AUTH] Dev server disconnected")
 
-log.info("\n" + "=" * 70)
-log.info("LINEAGE HARVEST COMPLETE")
-log.info("=" * 70)
+tracker.done(total_rows=len(df_lineage))
 ```
 
 if **name** == “**main**”:
