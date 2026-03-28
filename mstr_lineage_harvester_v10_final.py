@@ -57,6 +57,12 @@ FOLDER_ID     = ""  # "" = My Reports
 CUBE_NAME     = "MSTR_Lineage_Harvest"
 KEY_SF        = "standalone"
 
+# Leave empty [] to harvest ALL projects on PROD
+# Add project IDs to harvest only specific projects
+RUN_ONLY_PROJECT_IDS = [
+    # "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX",
+]
+
 # =============================================================================
 # FUNCTIONS — identical to Robert's reference script
 # =============================================================================
@@ -157,7 +163,11 @@ def main():
     env = Environment(connection=conn)
 
     loaded_projects = env.list_loaded_projects()
-    selected_projects = [[p.id, p.name] for p in loaded_projects]
+    if RUN_ONLY_PROJECT_IDS:
+        selected_projects = [[p.id, p.name] for p in loaded_projects
+                             if p.id in RUN_ONLY_PROJECT_IDS]
+    else:
+        selected_projects = [[p.id, p.name] for p in loaded_projects]
     print(f"\n  Projects: {len(selected_projects)}")
     for p in selected_projects:
         print(f"    {p[1]} ({p[0][:16]}...)")
@@ -614,14 +624,14 @@ def main():
               "attribute_column","table_name","db_instance_name"]
         print(df[[c for c in sc if c in df.columns]].head(15).to_string(index=False))
 
-    if df.empty:
+    if df.empty and not rows:
         print("\n  No rows. Done.")
         return
 
     # =========================================================================
-    # PUBLISH TO DEV
+    # PUBLISH TO DEV — 8 level cubes + 1 flat cube
     # =========================================================================
-    print(f"\n  [PUBLISH] SuperCube '{CUBE_NAME}' -> DEV")
+    print(f"\n  [PUBLISH] Connecting to DEV...")
     if RUN_MODE == "workstation":
         from mstrio.connection import get_connection
         dev_conn = get_connection(workstationData, project_name=DEV_PROJECT)
@@ -629,22 +639,99 @@ def main():
         dev_conn = Connection(DEV_URL, DEV_USERNAME, DEV_PASSWORD,
                               project_name=DEV_PROJECT, login_mode=1)
 
-    ds = SuperCube(connection=dev_conn, name=CUBE_NAME)
-    ds.add_table(name="LineageEdges", data_frame=df,
-                 update_policy="replace",
-                 to_attribute=list(df.columns), to_metric=[])
-    if FOLDER_ID:
-        ds.create(folder_id=FOLDER_ID)
-    else:
-        ds.create()
+    def publish_cube(conn, name, data_list, headers, folder_id):
+        """Create or update a SuperCube."""
+        if not data_list:
+            print(f"    SKIP {name} (empty)")
+            return None
+        cube_df = pd.DataFrame(data_list, columns=headers)
+        cube_df = cube_df.fillna("").astype(str)
+        try:
+            ds = SuperCube(connection=conn, name=name)
+            ds.add_table(name=name, data_frame=cube_df,
+                         update_policy="replace",
+                         to_attribute=headers, to_metric=[])
+            if folder_id:
+                ds.create(folder_id=folder_id)
+            else:
+                ds.create()
+            print(f"    OK   {name}: {len(cube_df):,} rows -> {ds.id}")
+            return ds.id
+        except Exception as e:
+            print(f"    FAIL {name}: {e}")
+            return None
 
-    print(f"  Cube ID: {ds.id}")
+    # --- 8 LEVEL CUBES (Robert's pattern) ---
+    print(f"\n  [PUBLISH] 8 level cubes...")
+
+    publish_cube(dev_conn, "Lineage_L0_Projects",
+                 selected_projects,
+                 ["project_id", "project_name"],
+                 FOLDER_ID)
+
+    publish_cube(dev_conn, "Lineage_L1_Documents",
+                 documents_all,
+                 ["project_id", "doc_type", "doc_id", "doc_name",
+                  "doc_enum_type", "doc_enum_subtype", "doc_folder"],
+                 FOLDER_ID)
+
+    publish_cube(dev_conn, "Lineage_L2_Datasets",
+                 datasets_all,
+                 ["project_id", "dataset_type", "dataset_subtype",
+                  "dataset_id", "dataset_name", "dataset_folder"],
+                 FOLDER_ID)
+
+    # L3: add metric formula column
+    l3_with_formula = []
+    for r in report_obj_all:
+        formula = metric_formulas.get(r[3], "") if r[1] in ("METRIC", "AGG_METRIC") else ""
+        l3_with_formula.append(r + [formula])
+    publish_cube(dev_conn, "Lineage_L3_ReportObjects",
+                 l3_with_formula,
+                 ["project_id", "repobj_type", "repobj_subtype",
+                  "repobj_id", "repobj_name", "metric_formula"],
+                 FOLDER_ID)
+
+    publish_cube(dev_conn, "Lineage_L4_SchemaObjects",
+                 schema_data,
+                 ["project_id", "tbl_name", "tbl_id", "tbl_datasource",
+                  "schemaobj_type", "schemaobj_id", "schemaobj_name",
+                  "attr_lu_table", "form_name", "form_datatype",
+                  "form_precision", "expression"],
+                 FOLDER_ID)
+
+    publish_cube(dev_conn, "Lineage_L12_Mapping",
+                 l12_mapping,
+                 ["project_id", "doc_id", "dataset_id"],
+                 FOLDER_ID)
+
+    publish_cube(dev_conn, "Lineage_L23_Mapping",
+                 l23_mapping,
+                 ["project_id", "dataset_id", "repobj_id"],
+                 FOLDER_ID)
+
+    publish_cube(dev_conn, "Lineage_L34_Mapping",
+                 l34_mapping,
+                 ["project_id", "repobj_id", "schemaobj_id"],
+                 FOLDER_ID)
+
+    # --- 1 FLAT CUBE (joined) ---
+    if not df.empty:
+        print(f"\n  [PUBLISH] Flat joined cube...")
+        publish_cube(dev_conn, CUBE_NAME,
+                     df.values.tolist(),
+                     list(df.columns),
+                     FOLDER_ID)
+
+    # --- Cleanup ---
     if RUN_MODE != "workstation":
         dev_conn.close()
 
     print(f"\n{'='*65}")
-    print(f"  COMPLETE | {len(df):,} rows | {(datetime.now()-t0).seconds}s")
-    print(f"  Cube: {CUBE_NAME} ({ds.id})")
+    print(f"  COMPLETE | {(datetime.now()-t0).seconds}s")
+    print(f"  9 cubes published to DEV")
+    print(f"  8 level cubes (Lineage_L0 through L34)")
+    print(f"  1 flat cube   ({CUBE_NAME})")
     print("=" * 65)
 
 main()
