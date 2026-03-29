@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-mstr_lineage_harvester_workstation.py  v11
+mstr_lineage_harvester_workstation.py  v11-clean
 Workstation "Run locally" — harvests from PROD, publishes to DEV.
 Publishes each level cube IMMEDIATELY after harvest.
-keep_alive on every loop to prevent session timeout.
 
 pip install mstrio-py pandas sql-metadata
 """
@@ -55,22 +54,25 @@ RUN_ONLY_PROJECT_IDS = []
 # FUNCTIONS
 # =============================================================================
 
-# Global references for keep_alive
 prod = None
 dev = None
 
-def keep_alive():
-    """Renew PROD and DEV sessions. If renew fails, reconnect."""
-    global prod, dev
-    for c in [prod, dev]:
-        if c:
-            try:
-                c.renew()
-            except:
-                try:
-                    c.connect()
-                except:
-                    pass
+def keep_alive_prod():
+    """Renew PROD session only. Reconnect if renew fails."""
+    if prod:
+        try: prod.renew()
+        except:
+            try: prod.connect()
+            except: pass
+
+def reconnect_prod():
+    """Force fresh PROD session."""
+    print("    Forcing fresh PROD session...")
+    try:
+        prod.connect()
+        print("    PROD reconnected OK")
+    except Exception as e:
+        print(f"    PROD reconnect warning: {e}")
 
 def unique_list(alist):
     alist.sort()
@@ -80,8 +82,7 @@ def get_object_deps(r, project_id):
     try:
         deps = r.list_dependencies()
         return [[project_id, r.type.value, r.id, r.name, d["type"], d["id"], d["name"]] for d in deps]
-    except Exception as e:
-        print(f"      [WARN] deps failed for {r.name}: {e}")
+    except:
         return []
 
 def search_deps(conn, project_id, obj_id, obj_type):
@@ -96,7 +97,7 @@ def resolve_down(conn, pid, object_dependants, deps_to_resolve, deps_finished):
     while deps_to_resolve:
         for dtr in deps_to_resolve[:]:
             count += 1
-            if count % 50 == 0: keep_alive()
+            if count % 100 == 0: keep_alive_prod()
             dep_type, dep_id, dep_name = dtr[4], dtr[5], dtr[6]
             rep_type, rep_id, rep_name = dtr[1], dtr[2], dtr[3]
             if (dep_id in [o[2] for o in object_dependants]) or (dep_type in [11, 61, 53, 22, 26]):
@@ -131,19 +132,15 @@ def map_standalone_obj(map_list, child_obj_list, child_obj_position):
 def safe(v): return str(v).strip() if v is not None else ""
 
 def full_path(obj):
-    """Build full folder path from ancestors: 'Shared Reports/Claims/Monthly'"""
     try:
         anc = getattr(obj, 'ancestors', [])
         if anc and len(anc) > 1:
-            # ancestors[0] is the project root, skip it
-            # ancestors[1..n] are the folder chain, last one is the parent folder
             return "/".join(a.get('name','') if isinstance(a,dict) else getattr(a,'name','') for a in anc[1:])
         return ""
     except:
         return ""
 
 def get_owner(obj):
-    """Get owner name safely."""
     try:
         ow = getattr(obj, 'owner', None)
         if ow:
@@ -165,12 +162,36 @@ def publish_cube(conn, name, data_list, headers, folder_id):
     if not data_list:
         print(f"    [SKIP] {name} (empty)")
         return None
-    keep_alive()
+    try: conn.renew()
+    except:
+        try: conn.connect()
+        except: pass
     cube_df = pd.DataFrame(data_list, columns=headers).fillna("").astype(str)
     try:
         ds = SuperCube(connection=conn, name=name)
         ds.add_table(name=name, data_frame=cube_df, update_policy="replace", to_attribute=headers, to_metric=[])
-        ds.create(folder_id=folder_id) if folder_id else ds.create()
+        try:
+            # Try create first (new cube)
+            ds.create(folder_id=folder_id, force=True) if folder_id else ds.create(force=True)
+        except Exception as ce:
+            # If create fails (cube exists without force support), try update
+            try:
+                ds.update()
+            except Exception as ue:
+                print(f"    [WARN] {name}: create/update both failed, retrying with new SuperCube...")
+                # Last resort: find existing cube by name and update it
+                try:
+                    from mstrio.project_objects import list_all_cubes
+                    existing = [c for c in list_all_cubes(connection=conn, to_dictionary=True) if c.get("name") == name]
+                    if existing:
+                        ds2 = SuperCube(connection=conn, id=existing[0]["id"])
+                        ds2.add_table(name=name, data_frame=cube_df, update_policy="replace", to_attribute=headers, to_metric=[])
+                        ds2.update()
+                        print(f"    [OK] {name}: {len(cube_df):,} rows -> {ds2.id} (updated existing)")
+                        return ds2.id
+                except: pass
+                print(f"    [FAIL] {name}: {ue}")
+                return None
         print(f"    [OK] {name}: {len(cube_df):,} rows -> {ds.id}")
         return ds.id
     except Exception as e:
@@ -188,29 +209,26 @@ def main():
     global prod, dev
     t0 = datetime.now()
     print("=" * 65)
-    print("  MSTR LINEAGE HARVESTER v11 (Workstation)")
+    print("  MSTR LINEAGE HARVESTER v11-clean (Workstation)")
     print(f"  PROD: {PROD_URL}")
     print(f"  DEV : {DEV_PROJECT} (Workstation session)")
     print("=" * 65)
 
     # === CONNECT ===
-    print("\n  [CONNECT] PROD...")
     prod = Connection(PROD_URL, PROD_USERNAME, PROD_PASSWORD, login_mode=1)
     env = Environment(connection=prod)
-    print(f"  [CONNECT] DEV (Workstation)...")
     dev = get_connection(workstationData, project_name=DEV_PROJECT)
-    print(f"  [CONNECT] Both connections established ({elapsed(t0)})")
+    print(f"  Both connections established ({elapsed(t0)})")
 
     loaded_projects = env.list_loaded_projects()
     if RUN_ONLY_PROJECT_IDS:
         selected_projects = [[p.id, p.name] for p in loaded_projects if p.id in RUN_ONLY_PROJECT_IDS]
     else:
         selected_projects = [[p.id, p.name] for p in loaded_projects]
-    print(f"\n  Projects: {len(selected_projects)}")
+    print(f"  Projects: {len(selected_projects)}")
     for p in selected_projects: print(f"    {p[1]}")
 
-    # === L0: PROJECTS ===
-    print(f"\n  [L0] Projects... ({elapsed(t0)})")
+    # === L0 ===
     publish_cube(dev, "Lineage_L0_Projects", selected_projects, ["project_id","project_name"], FOLDER_ID)
 
     # === L1: DOCUMENTS & DOSSIERS ===
@@ -221,20 +239,14 @@ def main():
         documents_all.append([pid, KEY_SF, KEY_SF, KEY_SF, 0, 0, "", ""])
         dossiers = list_dashboards(connection=prod, project_id=pid)
         print(f"    Dossiers: {len(dossiers)}")
-        for i, d in enumerate(dossiers):
-            keep_alive()
-            try:
-                documents_all.append([pid, "DOSSIER", d.id, d.name, d.type.name, d.subtype, full_path(d), get_owner(d)])
-            except Exception as e:
-                print(f"      [WARN] dossier {d.id}: {e}")
+        for d in dossiers:
+            try: documents_all.append([pid, "DOSSIER", d.id, d.name, d.type.name, d.subtype, full_path(d), get_owner(d)])
+            except: pass
         docs = list_documents(connection=prod, project_id=pid)
         print(f"    Documents: {len(docs)}")
-        for i, d in enumerate(docs):
-            keep_alive()
-            try:
-                documents_all.append([pid, "DOCUMENT", d.id, d.name, d.type.name, d.subtype, full_path(d), get_owner(d)])
-            except Exception as e:
-                print(f"      [WARN] document {d.id}: {e}")
+        for d in docs:
+            try: documents_all.append([pid, "DOCUMENT", d.id, d.name, d.type.name, d.subtype, full_path(d), get_owner(d)])
+            except: pass
     print(f"    TOTAL: {len(documents_all)} apps ({elapsed(t0)})")
     publish_cube(dev, "Lineage_L1_Documents", documents_all, ["project_id","doc_type","doc_id","doc_name","doc_enum_type","doc_enum_subtype","doc_folder","doc_owner"], FOLDER_ID)
 
@@ -246,21 +258,16 @@ def main():
         datasets_all.append([pid, KEY_SF, 0, KEY_SF, KEY_SF, '', ''])
         reports = list_reports(connection=prod, project_id=pid)
         print(f"    Reports: {len(reports)}")
-        for i, r in enumerate(reports):
-            keep_alive()
-            try:
-                datasets_all.append([pid, r.type.name.upper(), r.subtype, r.id, r.name, full_path(r), get_owner(r)])
-            except Exception as e:
-                print(f"      [WARN] report {r.id}: {e}")
-    # Cubes
+        for r in reports:
+            try: datasets_all.append([pid, r.type.name.upper(), r.subtype, r.id, r.name, full_path(r), get_owner(r)])
+            except: pass
     cubes_sql = {}
     for project in selected_projects:
         pid = project[0]; prod.select_project(project_id=pid)
         cubes_dicts = [c for c in list_all_cubes(connection=prod, to_dictionary=True) if c.get('subtype') in [776, 779]]
         print(f"    Cubes (776/779): {len(cubes_dicts)}")
         existing_ids = {d[3] for d in datasets_all}
-        for i, c in enumerate(cubes_dicts):
-            keep_alive()
+        for c in cubes_dicts:
             if c["id"] not in existing_ids:
                 datasets_all.append([pid, "CUBE", c.get("subtype", 776), c["id"], c["name"], "", ""])
             try:
@@ -268,13 +275,13 @@ def main():
                 if sv:
                     matches = re.findall(r"(select\s+.*?)\n\n", sv, flags=re.DOTALL | re.IGNORECASE)
                     cubes_sql[c["id"]] = " | ".join(" ".join(m.split()) for m in matches) if matches else " ".join(sv.split())
-            except Exception as e:
-                print(f"      [WARN] cube SQL {c['name']}: {e}")
+            except: pass
     print(f"    TOTAL: {len(datasets_all)} datasets, {len(cubes_sql)} cube SQL ({elapsed(t0)})")
     publish_cube(dev, "Lineage_L2_Datasets", datasets_all, ["project_id","dataset_type","dataset_subtype","dataset_id","dataset_name","dataset_folder","dataset_owner"], FOLDER_ID)
 
     # === L12: APP -> DATASET MAPPING ===
     print(f"\n  [L12] App -> Dataset mapping... ({elapsed(t0)})")
+    keep_alive_prod()
     l12_mapping, l23_mapping, l2_non_schema = [], [], []
     for project in selected_projects:
         pid = project[0]; prod.select_project(project_id=pid)
@@ -282,8 +289,7 @@ def main():
         dataset_ids = [d[3] for d in datasets_all if d[0] == pid]
         dossiers = list_dashboards(connection=prod)
         for i, d in enumerate(dossiers):
-            keep_alive()
-            if (i+1)%50==0: print(f"      dossier def {i+1}/{len(dossiers)}...")
+            if (i+1)%50==0: keep_alive_prod()
             try:
                 res = get_dossier_definition(prod, d.id)
                 if res is None: continue
@@ -293,11 +299,9 @@ def main():
                     if dset['id'] not in dataset_ids:
                         l2_non_schema.append([pid, "DATASET", 0, dset['id'], dset['name'], "dynamic", ""])
                         for ao in dset.get('availableObjects', []): l23_mapping.append([pid, dset['id'], ao['id']])
-            except Exception as e:
-                print(f"      [WARN] dossier def {d.id}: {e}")
+            except: pass
         docs = list_documents(connection=prod, project_id=pid)
-        for i, d in enumerate(docs):
-            keep_alive()
+        for d in docs:
             try:
                 for c in get_object_deps(d, pid):
                     if c[4] == 3: l12_mapping.append([pid, d.id, c[5]])
@@ -310,51 +314,94 @@ def main():
 
     # === L3: REPORT OBJECTS ===
     print(f"\n  [L3] Report objects... ({elapsed(t0)})")
-    report_obj_all = []; metric_formulas = {}
+    keep_alive_prod()
+    report_obj_all = []; metric_ids = []
     for project in selected_projects:
         pid = project[0]; prod.select_project(project_id=pid)
         report_obj_all.append([pid, KEY_SF, 0, KEY_SF, KEY_SF])
 
         attrs = list_attributes(connection=prod, project_id=pid)
         print(f"    Attributes: {len(attrs)}")
-        for i, a in enumerate(attrs):
-            keep_alive()
+        for a in attrs:
             try: report_obj_all.append([pid, a.type.name.upper(), a.subtype, a.id, a.name])
-            except Exception as e: print(f"      [WARN] attr {a.id}: {e}")
+            except: pass
 
         metrics = list_metrics(connection=prod, project_id=pid)
         print(f"    Metrics: {len(metrics)}")
-        for i, m in enumerate(metrics):
-            keep_alive()
-            if (i+1)%50==0: print(f"      metric {i+1}/{len(metrics)}...")
+        for m in metrics:
             try:
                 report_obj_all.append([pid, m.type.name.upper(), m.subtype, m.id, m.name])
-                try: metric_formulas[m.id] = m.expression.text if m.expression else ""
-                except: metric_formulas[m.id] = ""
-            except Exception as e:
-                print(f"      [WARN] metric {m.id}: {e}")
+                metric_ids.append(m.id)
+            except: pass
 
         facts = list_facts(connection=prod, project_id=pid)
         print(f"    Facts: {len(facts)}")
-        for i, f in enumerate(facts):
-            keep_alive()
+        for f in facts:
             try: report_obj_all.append([pid, f.type.name.upper(), f.subtype, f.id, f.name])
-            except Exception as e: print(f"      [WARN] fact {f.id}: {e}")
+            except: pass
 
-    print(f"    TOTAL: {len(report_obj_all)} objects, {len(metric_formulas)} formulas ({elapsed(t0)})")
-    l3f = [r + [metric_formulas.get(r[3],"") if r[1] in ("METRIC","AGG_METRIC") else ""] for r in report_obj_all]
-    publish_cube(dev, "Lineage_L3_ReportObjects", l3f, ["project_id","repobj_type","repobj_subtype","repobj_id","repobj_name","metric_formula"], FOLDER_ID)
+    print(f"    TOTAL: {len(report_obj_all)} objects ({elapsed(t0)})")
+    publish_cube(dev, "Lineage_L3_ReportObjects", report_obj_all, ["project_id","repobj_type","repobj_subtype","repobj_id","repobj_name"], FOLDER_ID)
+
+    # === L3b: METRIC FORMULAS via Tier 2 Object Definition API ===
+    # Uses GET /api/objects/{id}?type=4 — NOT the Modeling Service.
+    # 10s timeout per call. 10 consecutive failures = skip remaining.
+    # Entire block wrapped — if L3b fails, script continues without formulas.
+    print(f"\n  [L3b] Metric formulas via Object API... ({elapsed(t0)})")
+    import requests as _req
+    metric_formulas = {}
+    try:
+        api_base = prod.base_url
+        headers_api = {"X-MSTR-AuthToken": prod.token, "X-MSTR-ProjectID": selected_projects[0][0], "Accept": "application/json"}
+        ok_count = 0; fail_count = 0; consec_fail = 0
+        for i, mid in enumerate(metric_ids):
+            if consec_fail >= 10:
+                print(f"    [SKIP] 10 consecutive failures — endpoint not available. Skipping remaining {len(metric_ids)-i} metrics.")
+                break
+            if (i+1)%50==0:
+                keep_alive_prod()
+                headers_api["X-MSTR-AuthToken"] = prod.token
+                print(f"      formula {i+1}/{len(metric_ids)}... ({ok_count} ok, {fail_count} skip)")
+            try:
+                r = _req.get(f"{api_base}/objects/{mid}?type=4", headers=headers_api, verify=False, timeout=10)
+                if r.status_code == 200:
+                    data = r.json()
+                    formula = ""
+                    defn = data.get("definition", data)
+                    expr = defn.get("expression", {})
+                    if isinstance(expr, dict):
+                        formula = expr.get("text", "")
+                    if not formula:
+                        formula = defn.get("formula", "")
+                    if not formula:
+                        met = defn.get("metric", {})
+                        if met: formula = met.get("expression", {}).get("text", "")
+                    if formula:
+                        metric_formulas[mid] = formula.strip()
+                        ok_count += 1; consec_fail = 0
+                    else:
+                        fail_count += 1; consec_fail += 1
+                else:
+                    fail_count += 1; consec_fail += 1
+            except _req.exceptions.Timeout:
+                fail_count += 1; consec_fail += 1
+            except Exception as e:
+                fail_count += 1; consec_fail += 1
+                if fail_count <= 3: print(f"      [WARN] metric {mid}: {e}")
+        print(f"    Metric formulas: {ok_count} captured, {fail_count} blank ({elapsed(t0)})")
+    except Exception as e:
+        print(f"    [WARN] L3b failed entirely: {e} — continuing without formulas")
 
     # === L23: DATASET -> REPORT OBJECT MAPPING ===
     print(f"\n  [L23] Dataset -> Report Object mapping... ({elapsed(t0)})")
+    keep_alive_prod()
     object_dependants, deps_completed_all = [], []
     for project in selected_projects:
         pid = project[0]; prod.select_project(project_id=pid)
         reports = list_reports(connection=prod, project_id=pid)
         print(f"    Reports: {len(reports)} — getting dependencies...")
         for i, r in enumerate(reports):
-            keep_alive()
-            if (i+1)%50==0: print(f"      report deps {i+1}/{len(reports)}...")
+            if (i+1)%50==0: keep_alive_prod()
             try: object_dependants.extend(get_object_deps(r, pid))
             except: pass
         df_, dr_ = [], []
@@ -368,14 +415,15 @@ def main():
 
     # === L4: SCHEMA OBJECTS FROM LOGICAL TABLES ===
     print(f"\n  [L4] Schema objects from logical tables... ({elapsed(t0)})")
+    reconnect_prod()
     schema_data = []
     for project in selected_projects:
         pid = project[0]; prod.select_project(project_id=pid)
         tables = list_logical_tables(connection=prod)
         print(f"    Tables: {len(tables)}")
         for i, table in enumerate(tables):
-            keep_alive()
-            if (i+1)%25==0: print(f"      table {i+1}/{len(tables)}...")
+            if (i+1)%25==0: keep_alive_prod()
+            if (i+1)%50==0: print(f"      table {i+1}/{len(tables)}...")
             tn, tid = table.name, table.id
             try: tds = table.primary_data_source.name
             except: tds = ""
@@ -411,14 +459,14 @@ def main():
 
     # === L34: METRIC -> SCHEMA MAPPING ===
     print(f"\n  [L34] Metric -> Schema mapping... ({elapsed(t0)})")
+    reconnect_prod()
     od2, dc2 = [], []
     for project in selected_projects:
         pid = project[0]; prod.select_project(project_id=pid)
         metrics = list_metrics(connection=prod, project_id=pid)
         print(f"    Metrics: {len(metrics)} — getting dependencies...")
         for i, m in enumerate(metrics):
-            keep_alive()
-            if (i+1)%50==0: print(f"      metric deps {i+1}/{len(metrics)}...")
+            if (i+1)%50==0: keep_alive_prod()
             try: od2.extend(get_object_deps(m, pid))
             except: pass
         df2, dr2 = [], []
@@ -494,7 +542,6 @@ def main():
     print(f"    FLAT TABLE: {len(df):,} rows x {len(FINAL_COLS)} cols ({elapsed(t0)})")
 
     if not df.empty:
-        print(f"\n  [PUBLISH] Flat joined cube...")
         publish_cube(dev, CUBE_NAME, df.values.tolist(), list(df.columns), FOLDER_ID)
 
     # === SUMMARY ===
