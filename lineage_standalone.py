@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-mstr_lineage_harvester_workstation.py  v11-clean
-Workstation "Run locally" — harvests from PROD, publishes to DEV.
+mstr_lineage_harvester_standalone.py  v11-clean
+VS Code / local Python — harvests from PROD, publishes to DEV + CSV export.
 Publishes each level cube IMMEDIATELY after harvest.
+No Workstation dependency.
 
 pip install mstrio-py pandas sql-metadata
 """
@@ -10,7 +11,7 @@ pip install mstrio-py pandas sql-metadata
 import csv, json, itertools, re, logging, warnings
 import pandas as pd
 from datetime import datetime
-from mstrio.connection import Connection, get_connection
+from mstrio.connection import Connection
 from mstrio.server import Environment
 from mstrio.object_management import full_search
 from mstrio.types import ObjectSubTypes, ObjectTypes
@@ -39,16 +40,23 @@ log = logging.getLogger("lineage")
 # CONFIGURATION
 # =============================================================================
 
+# PROD — harvest lineage from here
 PROD_URL      = "https://YOUR_PROD_SERVER/MicroStrategyLibrarySTD"
 PROD_USERNAME = "YOUR_USERNAME"
 PROD_PASSWORD = "YOUR_PASSWORD"
 
+# DEV — publish cubes here
+DEV_URL       = "https://YOUR_DEV_SERVER/MicroStrategyLibrarySTD"
+DEV_USERNAME  = "YOUR_USERNAME"
+DEV_PASSWORD  = "YOUR_PASSWORD"
 DEV_PROJECT   = "YOUR_DEV_PROJECT_NAME"
-FOLDER_ID     = ""
+
+FOLDER_ID     = ""                       # folder ID for cubes, or "" for default
 CUBE_NAME     = "MSTR_Lineage_Harvest"
 KEY_SF        = "standalone"
+CSV_EXPORT    = True                     # also save CSV files locally
 
-RUN_ONLY_PROJECT_IDS = []
+RUN_ONLY_PROJECT_IDS = []                # [] = all projects, or ["id1","id2"]
 
 # =============================================================================
 # FUNCTIONS
@@ -171,15 +179,11 @@ def publish_cube(conn, name, data_list, headers, folder_id):
         ds = SuperCube(connection=conn, name=name)
         ds.add_table(name=name, data_frame=cube_df, update_policy="replace", to_attribute=headers, to_metric=[])
         try:
-            # Try create first (new cube)
             ds.create(folder_id=folder_id, force=True) if folder_id else ds.create(force=True)
         except Exception as ce:
-            # If create fails (cube exists without force support), try update
             try:
                 ds.update()
             except Exception as ue:
-                print(f"    [WARN] {name}: create/update both failed, retrying with new SuperCube...")
-                # Last resort: find existing cube by name and update it
                 try:
                     from mstrio.project_objects import list_all_cubes
                     existing = [c for c in list_all_cubes(connection=conn, to_dictionary=True) if c.get("name") == name]
@@ -198,6 +202,13 @@ def publish_cube(conn, name, data_list, headers, folder_id):
         print(f"    [FAIL] {name}: {e}")
         return None
 
+def export_csv(name, data_list, headers):
+    """Export a level's data to CSV."""
+    if not CSV_EXPORT or not data_list: return
+    fname = f"{name}.csv"
+    pd.DataFrame(data_list, columns=headers).fillna("").astype(str).to_csv(fname, index=False, encoding='utf-8', quoting=csv.QUOTE_ALL)
+    print(f"    [CSV] {fname}")
+
 def elapsed(t0):
     return f"{(datetime.now()-t0).seconds}s"
 
@@ -209,15 +220,18 @@ def main():
     global prod, dev
     t0 = datetime.now()
     print("=" * 65)
-    print("  MSTR LINEAGE HARVESTER v11-clean (Workstation)")
+    print("  MSTR LINEAGE HARVESTER v11-clean (Standalone)")
     print(f"  PROD: {PROD_URL}")
-    print(f"  DEV : {DEV_PROJECT} (Workstation session)")
+    print(f"  DEV : {DEV_URL} ({DEV_PROJECT})")
+    print(f"  CSV : {'enabled' if CSV_EXPORT else 'disabled'}")
     print("=" * 65)
 
     # === CONNECT ===
-    prod = Connection(PROD_URL, PROD_USERNAME, PROD_PASSWORD, login_mode=1)
+    print("\n  Connecting to PROD...")
+    prod = Connection(PROD_URL, PROD_USERNAME, PROD_PASSWORD, login_mode=1, ssl_verify=False)
     env = Environment(connection=prod)
-    dev = get_connection(workstationData, project_name=DEV_PROJECT)
+    print("  Connecting to DEV...")
+    dev = Connection(DEV_URL, DEV_USERNAME, DEV_PASSWORD, project_name=DEV_PROJECT, login_mode=1, ssl_verify=False)
     print(f"  Both connections established ({elapsed(t0)})")
 
     loaded_projects = env.list_loaded_projects()
@@ -228,17 +242,14 @@ def main():
     print(f"  Projects: {len(selected_projects)}")
     for p in selected_projects: print(f"    {p[1]}")
 
-    # Dynamic cube prefix from project name
-    if len(selected_projects) == 1:
-        proj_tag = re.sub(r"[^A-Za-z0-9]", "", selected_projects[0][1])
-    else:
-        proj_tag = "Multi"
-    cn = lambda suffix: f"Lineage_{proj_tag}_{suffix}"
-    harvest_name = f"MSTR_Lineage_Harvest_{proj_tag}"
-    print(f"  Cube prefix: Lineage_{proj_tag}_*")
+    # Fixed universal cube names — all projects go into the same cubes
+    cn = lambda suffix: f"Lineage_{suffix}"
+    csv_n = lambda suffix: suffix
+    harvest_name = CUBE_NAME
 
     # === L0 ===
     publish_cube(dev, cn("L0_Projects"), selected_projects, ["project_id","project_name"], FOLDER_ID)
+    export_csv(csv_n("L0_Projects"), selected_projects, ["project_id","project_name"])
 
     # === L1: DOCUMENTS & DOSSIERS ===
     print(f"\n  [L1] Documents & Dossiers... ({elapsed(t0)})")
@@ -256,8 +267,10 @@ def main():
         for d in docs:
             try: documents_all.append([pid, "DOCUMENT", d.id, d.name, d.type.name, d.subtype, full_path(d), get_owner(d)])
             except: pass
+    l1_headers = ["project_id","doc_type","doc_id","doc_name","doc_enum_type","doc_enum_subtype","doc_folder","doc_owner"]
     print(f"    TOTAL: {len(documents_all)} apps ({elapsed(t0)})")
-    publish_cube(dev, cn("L1_Documents"), documents_all, ["project_id","doc_type","doc_id","doc_name","doc_enum_type","doc_enum_subtype","doc_folder","doc_owner"], FOLDER_ID)
+    publish_cube(dev, cn("L1_Documents"), documents_all, l1_headers, FOLDER_ID)
+    export_csv(csv_n("L1_Documents"), documents_all, l1_headers)
 
     # === L2: DATASETS ===
     print(f"\n  [L2] Datasets... ({elapsed(t0)})")
@@ -276,12 +289,10 @@ def main():
         cubes_dicts = [c for c in list_all_cubes(connection=prod, to_dictionary=True) if c.get('subtype') in [776, 779]]
         print(f"    Cubes (776/779): {len(cubes_dicts)}")
         existing_ids = {d[3] for d in datasets_all}
-        # Suppress mstrio error logging during SQL extraction (very noisy)
         _mstrio_log = logging.getLogger("mstrio"); _prev_level = _mstrio_log.level; _mstrio_log.setLevel(logging.CRITICAL)
         sql_tried = 0; sql_ok = 0
         for c in cubes_dicts:
             sql_text = ""
-            # Only attempt SQL on custom SQL cubes (779), not schema OLAP cubes (776)
             if c.get("subtype") == 779:
                 sql_tried += 1
                 try:
@@ -299,8 +310,10 @@ def main():
                     if d[3] == c["id"]: d[7] = sql_text; break
         _mstrio_log.setLevel(_prev_level)
         print(f"    Cube SQL: tried {sql_tried}, captured {sql_ok}")
+    l2_headers = ["project_id","dataset_type","dataset_subtype","dataset_id","dataset_name","dataset_folder","dataset_owner","cube_sql"]
     print(f"    TOTAL: {len(datasets_all)} datasets, {len(cubes_sql)} cube SQL ({elapsed(t0)})")
-    publish_cube(dev, cn("L2_Datasets"), datasets_all, ["project_id","dataset_type","dataset_subtype","dataset_id","dataset_name","dataset_folder","dataset_owner","cube_sql"], FOLDER_ID)
+    publish_cube(dev, cn("L2_Datasets"), datasets_all, l2_headers, FOLDER_ID)
+    export_csv(csv_n("L2_Datasets"), datasets_all, l2_headers)
 
     # === L12: APP -> DATASET MAPPING ===
     print(f"\n  [L12] App -> Dataset mapping... ({elapsed(t0)})")
@@ -334,6 +347,7 @@ def main():
     l12_mapping = map_standalone_obj(l12_mapping, datasets_all, 3)
     print(f"    TOTAL L12: {len(l12_mapping)} mappings ({elapsed(t0)})")
     publish_cube(dev, cn("L12_Mapping"), l12_mapping, ["project_id","doc_id","dataset_id"], FOLDER_ID)
+    export_csv(csv_n("L12_Mapping"), l12_mapping, ["project_id","doc_id","dataset_id"])
 
     # === L3: REPORT OBJECTS ===
     print(f"\n  [L3] Report objects... ({elapsed(t0)})")
@@ -363,13 +377,12 @@ def main():
             try: report_obj_all.append([pid, f.type.name.upper(), f.subtype, f.id, f.name])
             except: pass
 
+    l3_headers = ["project_id","repobj_type","repobj_subtype","repobj_id","repobj_name"]
     print(f"    TOTAL: {len(report_obj_all)} objects ({elapsed(t0)})")
-    publish_cube(dev, cn("L3_ReportObjects"), report_obj_all, ["project_id","repobj_type","repobj_subtype","repobj_id","repobj_name"], FOLDER_ID)
+    publish_cube(dev, cn("L3_ReportObjects"), report_obj_all, l3_headers, FOLDER_ID)
+    export_csv(csv_n("L3_ReportObjects"), report_obj_all, l3_headers)
 
     # === L3b: METRIC FORMULAS via Tier 2 Object Definition API ===
-    # Uses GET /api/objects/{id}?type=4 — NOT the Modeling Service.
-    # 10s timeout per call. 10 consecutive failures = skip remaining.
-    # Entire block wrapped — if L3b fails, script continues without formulas.
     print(f"\n  [L3b] Metric formulas via Object API... ({elapsed(t0)})")
     import requests as _req
     metric_formulas = {}
@@ -435,13 +448,13 @@ def main():
     l23_mapping = unique_list(map_standalone_obj(unique_list(map23), report_obj_all, 3))
     print(f"    TOTAL L23: {len(l23_mapping)} mappings ({elapsed(t0)})")
     publish_cube(dev, cn("L23_Mapping"), l23_mapping, ["project_id","dataset_id","repobj_id"], FOLDER_ID)
+    export_csv(csv_n("L23_Mapping"), l23_mapping, ["project_id","dataset_id","repobj_id"])
 
     # === L4: SCHEMA OBJECTS FROM LOGICAL TABLES ===
     print(f"\n  [L4] Schema objects from logical tables... ({elapsed(t0)})")
     schema_data = []
     for project in selected_projects:
         pid = project[0]
-        # Try up to 2 times per project
         for attempt in range(1, 3):
             try:
                 reconnect_prod()
@@ -481,13 +494,15 @@ def main():
                                         schema_data.append([pid,tn,tid,tds,f.type.name,f.id,f.name,"NA","NA",fd,fp,et])
                     except Exception as e:
                         print(f"      [WARN] table {tn}: {e}")
-                break  # success, don't retry
+                break
             except Exception as e:
                 print(f"    [WARN] L4 attempt {attempt} failed for project {pid}: {e}")
                 if attempt == 2:
-                    print(f"    [SKIP] L4 failed for project {pid} after 2 attempts — continuing without schema data for this project")
+                    print(f"    [SKIP] L4 failed after 2 attempts — continuing without schema data for this project")
+    l4_headers = ["project_id","tbl_name","tbl_id","tbl_datasource","schemaobj_type","schemaobj_id","schemaobj_name","attr_lu_table","form_name","form_datatype","form_precision","expression"]
     print(f"    TOTAL L4: {len(schema_data)} entries ({elapsed(t0)})")
-    publish_cube(dev, cn("L4_SchemaObjects"), schema_data, ["project_id","tbl_name","tbl_id","tbl_datasource","schemaobj_type","schemaobj_id","schemaobj_name","attr_lu_table","form_name","form_datatype","form_precision","expression"], FOLDER_ID)
+    publish_cube(dev, cn("L4_SchemaObjects"), schema_data, l4_headers, FOLDER_ID)
+    export_csv(csv_n("L4_SchemaObjects"), schema_data, l4_headers)
 
     # === L34: METRIC -> SCHEMA MAPPING ===
     print(f"\n  [L34] Metric -> Schema mapping... ({elapsed(t0)})")
@@ -514,6 +529,7 @@ def main():
     l34_mapping = unique_list(l34_mapping)
     print(f"    TOTAL L34: {len(l34_mapping)} mappings ({elapsed(t0)})")
     publish_cube(dev, cn("L34_Mapping"), l34_mapping, ["project_id","repobj_id","schemaobj_id"], FOLDER_ID)
+    export_csv(csv_n("L34_Mapping"), l34_mapping, ["project_id","repobj_id","schemaobj_id"])
 
     # === DONE WITH PROD ===
     prod.close()
@@ -576,12 +592,22 @@ def main():
     df=df.fillna("").astype(str).apply(lambda s: s.str.strip()).drop_duplicates().reset_index(drop=True)
     print(f"    FLAT TABLE: {len(df):,} rows x {len(FINAL_COLS)} cols ({elapsed(t0)})")
 
+    if CSV_EXPORT:
+        flat_csv = f"{harvest_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        df.to_csv(flat_csv, index=False, encoding='utf-8', quoting=csv.QUOTE_ALL)
+        print(f"    [CSV] {flat_csv}")
+
     if not df.empty:
         publish_cube(dev, harvest_name, df.values.tolist(), list(df.columns), FOLDER_ID)
 
+    # === CLEANUP ===
+    try: dev.close()
+    except: pass
+    print(f"\n  [DEV] Connection closed")
+
     # === SUMMARY ===
     print(f"\n{'='*65}")
-    print(f"  COMPLETE | {elapsed(t0)} | Project: {proj_tag}")
+    print(f"  COMPLETE | {elapsed(t0)} | {len(selected_projects)} project(s)")
     print(f"  9 cubes published to DEV:")
     print(f"    {cn('L0_Projects')}")
     print(f"    {cn('L1_Documents')}        ({len(documents_all)} rows)")
@@ -592,6 +618,9 @@ def main():
     print(f"    {cn('L4_SchemaObjects')}    ({len(schema_data)} rows)")
     print(f"    {cn('L34_Mapping')}         ({len(l34_mapping)} rows)")
     print(f"    {harvest_name}  ({len(df)} rows)")
+    if CSV_EXPORT:
+        print(f"  CSV files saved to current directory")
     print("=" * 65)
 
-main()
+if __name__ == "__main__":
+    main()
