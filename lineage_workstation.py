@@ -240,6 +240,60 @@ def main():
     # === L0 ===
     publish_cube(dev, cn("L0_Projects"), selected_projects, ["project_id","project_name"], FOLDER_ID)
 
+    # === L4: SCHEMA OBJECTS FROM LOGICAL TABLES ===
+    # RUN FIRST — Modeling Service needs a fresh I-Server session.
+    # After L23 (10K+ API calls), the Modeling Service session dies.
+    print(f"\n  [L4] Schema objects from logical tables (FIRST — fresh session)... ({elapsed(t0)})")
+    schema_data = []
+    for project in selected_projects:
+        pid = project[0]
+        for attempt in range(1, 3):
+            try:
+                if attempt > 1: reconnect_prod()
+                prod.select_project(project_id=pid)
+                tables = list_logical_tables(connection=prod)
+                print(f"    Tables: {len(tables)} (attempt {attempt})")
+                for i, table in enumerate(tables):
+                    if (i+1)%25==0: keep_alive_prod()
+                    if (i+1)%50==0: print(f"      table {i+1}/{len(tables)}...")
+                    tn, tid = table.name, table.id
+                    try: tds = table.primary_data_source.name
+                    except: tds = ""
+                    try:
+                        if table.attributes and table.subtype == 3840:
+                            for a in table.attributes:
+                                if a.id and a.sub_type == "attribute":
+                                    try: a.list_properties()
+                                    except: pass
+                                    try: altn = a.attribute_lookup_table.name
+                                    except: altn = ""
+                                    for form in (a.forms or []):
+                                        if not form.is_form_group:
+                                            fd = form.data_type.type if form.data_type else "NA"
+                                            fp = form.data_type.precision if form.data_type else "NA"
+                                            for expr in (form.expressions or []):
+                                                try: et = expr.expression.text
+                                                except: et = "NA"
+                                                schema_data.append([pid,tn,tid,tds,a.type.name,a.id,a.name,altn,form.name,fd,fp,et])
+                        if table.facts:
+                            for f in table.facts:
+                                if f.id:
+                                    try: fd,fp = f.data_type.type, f.data_type.precision
+                                    except: fd,fp = "NA","NA"
+                                    for expr in (f.expressions or []):
+                                        try: et = expr.expression.text
+                                        except: et = "NA"
+                                        schema_data.append([pid,tn,tid,tds,f.type.name,f.id,f.name,"NA","NA",fd,fp,et])
+                    except Exception as e:
+                        print(f"      [WARN] table {tn}: {e}")
+                break
+            except Exception as e:
+                print(f"    [WARN] L4 attempt {attempt} failed for project {pid}: {e}")
+                if attempt == 2:
+                    print(f"    [SKIP] L4 failed for project {pid} after 2 attempts — continuing without schema data")
+    print(f"    TOTAL L4: {len(schema_data)} entries ({elapsed(t0)})")
+    publish_cube(dev, cn("L4_SchemaObjects"), schema_data, ["project_id","tbl_name","tbl_id","tbl_datasource","schemaobj_type","schemaobj_id","schemaobj_name","attr_lu_table","form_name","form_datatype","form_precision","expression"], FOLDER_ID)
+
     # === L1: DOCUMENTS & DOSSIERS ===
     print(f"\n  [L1] Documents & Dossiers... ({elapsed(t0)})")
     documents_all = []
@@ -366,39 +420,60 @@ def main():
     print(f"    TOTAL: {len(report_obj_all)} objects ({elapsed(t0)})")
     publish_cube(dev, cn("L3_ReportObjects"), report_obj_all, ["project_id","repobj_type","repobj_subtype","repobj_id","repobj_name"], FOLDER_ID)
 
-    # === L3b: METRIC FORMULAS via Tier 2 Object Definition API ===
-    # Uses GET /api/objects/{id}?type=4 — NOT the Modeling Service.
-    # 10s timeout per call. 10 consecutive failures = skip remaining.
-    # Entire block wrapped — if L3b fails, script continues without formulas.
-    print(f"\n  [L3b] Metric formulas via Object API... ({elapsed(t0)})")
+    # === L3b: METRIC FORMULAS via Changeset + Modeling Service ===
+    # Creates ONE changeset (persistent Modeling Service session), then
+    # fetches all metric expressions through it. No per-metric session rebuild.
+    # Falls back to Tier 2 Object API if changeset fails.
+    # 10 consecutive failures = bail out.
+    print(f"\n  [L3b] Metric formulas via Changeset... ({elapsed(t0)})")
     import requests as _req
     metric_formulas = {}
     try:
         api_base = prod.base_url
-        headers_api = {"X-MSTR-AuthToken": prod.token, "X-MSTR-ProjectID": selected_projects[0][0], "Accept": "application/json"}
+        pid0 = selected_projects[0][0]
+        headers_api = {"X-MSTR-AuthToken": prod.token, "X-MSTR-ProjectID": pid0, "Accept": "application/json", "Content-Type": "application/json"}
+
+        # Step 1: Create changeset (opens persistent Modeling Service session)
+        changeset_id = None
+        try:
+            cs_resp = _req.post(f"{api_base}/model/changesets", headers=headers_api, verify=False, timeout=30)
+            if cs_resp.status_code in (200, 201):
+                changeset_id = cs_resp.json().get("id", cs_resp.headers.get("X-MSTR-MS-Changeset", ""))
+                print(f"    Changeset created: {changeset_id[:16]}...")
+            else:
+                print(f"    [WARN] Changeset creation returned {cs_resp.status_code} — trying without changeset")
+        except Exception as e:
+            print(f"    [WARN] Changeset creation failed: {e} — trying without changeset")
+
+        # Step 2: Fetch metric formulas
         ok_count = 0; fail_count = 0; consec_fail = 0
         for i, mid in enumerate(metric_ids):
             if consec_fail >= 10:
-                print(f"    [SKIP] 10 consecutive failures — endpoint not available. Skipping remaining {len(metric_ids)-i} metrics.")
+                print(f"    [SKIP] 10 consecutive failures — skipping remaining {len(metric_ids)-i} metrics.")
                 break
             if (i+1)%50==0:
                 keep_alive_prod()
                 headers_api["X-MSTR-AuthToken"] = prod.token
                 print(f"      formula {i+1}/{len(metric_ids)}... ({ok_count} ok, {fail_count} skip)")
             try:
-                r = _req.get(f"{api_base}/objects/{mid}?type=4", headers=headers_api, verify=False, timeout=10)
+                # Build request headers with changeset if available
+                req_headers = {**headers_api}
+                if changeset_id:
+                    req_headers["X-MSTR-MS-Changeset"] = changeset_id
+
+                r = _req.get(f"{api_base}/model/metrics/{mid}", headers=req_headers, verify=False, timeout=15)
                 if r.status_code == 200:
                     data = r.json()
                     formula = ""
-                    defn = data.get("definition", data)
-                    expr = defn.get("expression", {})
+                    # Path 1: expression.text (standard)
+                    expr = data.get("expression", {})
                     if isinstance(expr, dict):
                         formula = expr.get("text", "")
-                    if not formula:
-                        formula = defn.get("formula", "")
-                    if not formula:
-                        met = defn.get("metric", {})
-                        if met: formula = met.get("expression", {}).get("text", "")
+                    # Path 2: expression.tokens[].value
+                    if not formula and isinstance(expr, dict):
+                        tokens = expr.get("tokens", [])
+                        if tokens:
+                            formula = " ".join(t.get("value", "") for t in tokens if t.get("value"))
                     if formula:
                         metric_formulas[mid] = formula.strip()
                         ok_count += 1; consec_fail = 0
@@ -411,6 +486,14 @@ def main():
             except Exception as e:
                 fail_count += 1; consec_fail += 1
                 if fail_count <= 3: print(f"      [WARN] metric {mid}: {e}")
+
+        # Step 3: Close changeset (discard — we only read, no changes)
+        if changeset_id:
+            try:
+                _req.delete(f"{api_base}/model/changesets/{changeset_id}", headers=headers_api, verify=False, timeout=10)
+                print(f"    Changeset closed")
+            except: pass
+
         print(f"    Metric formulas: {ok_count} captured, {fail_count} blank ({elapsed(t0)})")
     except Exception as e:
         print(f"    [WARN] L3b failed entirely: {e} — continuing without formulas")
@@ -435,59 +518,6 @@ def main():
     l23_mapping = unique_list(map_standalone_obj(unique_list(map23), report_obj_all, 3))
     print(f"    TOTAL L23: {len(l23_mapping)} mappings ({elapsed(t0)})")
     publish_cube(dev, cn("L23_Mapping"), l23_mapping, ["project_id","dataset_id","repobj_id"], FOLDER_ID)
-
-    # === L4: SCHEMA OBJECTS FROM LOGICAL TABLES ===
-    print(f"\n  [L4] Schema objects from logical tables... ({elapsed(t0)})")
-    schema_data = []
-    for project in selected_projects:
-        pid = project[0]
-        # Try up to 2 times per project
-        for attempt in range(1, 3):
-            try:
-                reconnect_prod()
-                prod.select_project(project_id=pid)
-                tables = list_logical_tables(connection=prod)
-                print(f"    Tables: {len(tables)} (attempt {attempt})")
-                for i, table in enumerate(tables):
-                    if (i+1)%25==0: keep_alive_prod()
-                    if (i+1)%50==0: print(f"      table {i+1}/{len(tables)}...")
-                    tn, tid = table.name, table.id
-                    try: tds = table.primary_data_source.name
-                    except: tds = ""
-                    try:
-                        if table.attributes and table.subtype == 3840:
-                            for a in table.attributes:
-                                if a.id and a.sub_type == "attribute":
-                                    try: a.list_properties()
-                                    except: pass
-                                    try: altn = a.attribute_lookup_table.name
-                                    except: altn = ""
-                                    for form in (a.forms or []):
-                                        if not form.is_form_group:
-                                            fd = form.data_type.type if form.data_type else "NA"
-                                            fp = form.data_type.precision if form.data_type else "NA"
-                                            for expr in (form.expressions or []):
-                                                try: et = expr.expression.text
-                                                except: et = "NA"
-                                                schema_data.append([pid,tn,tid,tds,a.type.name,a.id,a.name,altn,form.name,fd,fp,et])
-                        if table.facts:
-                            for f in table.facts:
-                                if f.id:
-                                    try: fd,fp = f.data_type.type, f.data_type.precision
-                                    except: fd,fp = "NA","NA"
-                                    for expr in (f.expressions or []):
-                                        try: et = expr.expression.text
-                                        except: et = "NA"
-                                        schema_data.append([pid,tn,tid,tds,f.type.name,f.id,f.name,"NA","NA",fd,fp,et])
-                    except Exception as e:
-                        print(f"      [WARN] table {tn}: {e}")
-                break  # success, don't retry
-            except Exception as e:
-                print(f"    [WARN] L4 attempt {attempt} failed for project {pid}: {e}")
-                if attempt == 2:
-                    print(f"    [SKIP] L4 failed for project {pid} after 2 attempts — continuing without schema data for this project")
-    print(f"    TOTAL L4: {len(schema_data)} entries ({elapsed(t0)})")
-    publish_cube(dev, cn("L4_SchemaObjects"), schema_data, ["project_id","tbl_name","tbl_id","tbl_datasource","schemaobj_type","schemaobj_id","schemaobj_name","attr_lu_table","form_name","form_datatype","form_precision","expression"], FOLDER_ID)
 
     # === L34: METRIC -> SCHEMA MAPPING ===
     print(f"\n  [L34] Metric -> Schema mapping... ({elapsed(t0)})")
