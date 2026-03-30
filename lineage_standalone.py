@@ -407,7 +407,7 @@ def main():
     # === L3: REPORT OBJECTS ===
     print(f"\n  [L3] Report objects... ({elapsed(t0)})")
     keep_alive_prod()
-    report_obj_all = []; metric_ids = []
+    report_obj_all = []; metric_ids = []; metric_name_lookup = {}; pid_lookup = {}
     for project in selected_projects:
         pid = project[0]; prod.select_project(project_id=pid)
         report_obj_all.append([pid, KEY_SF, 0, KEY_SF, KEY_SF])
@@ -424,6 +424,8 @@ def main():
             try:
                 report_obj_all.append([pid, m.type.name.upper(), m.subtype, m.id, m.name])
                 metric_ids.append(m.id)
+                metric_name_lookup[m.id] = m.name
+                pid_lookup[m.id] = pid
             except: pass
 
         facts = list_facts(connection=prod, project_id=pid)
@@ -507,6 +509,16 @@ def main():
         print(f"    Metric formulas: {ok_count} captured, {fail_count} blank ({elapsed(t0)})")
     except Exception as e:
         print(f"    [WARN] L3b failed entirely: {e} — continuing without formulas")
+
+    # Publish metric formulas as separate cube
+    if metric_formulas:
+        mf_data = [[pid_lookup.get(mid, selected_projects[0][0]), mid, metric_name_lookup.get(mid, ""), formula]
+                    for mid, formula in metric_formulas.items()]
+        mf_headers = ["project_id","metric_id","metric_name","metric_formula"]
+        publish_cube(dev, cn("L3b_MetricFormulas"), mf_data, mf_headers, FOLDER_ID)
+        export_csv(csv_n("L3b_MetricFormulas"), mf_data, mf_headers)
+    else:
+        print(f"    [SKIP] {cn('L3b_MetricFormulas')} (no formulas captured)")
 
     # === L23: DATASET -> REPORT OBJECT MAPPING ===
     print(f"\n  [L23] Dataset -> Report Object mapping... ({elapsed(t0)})")
@@ -634,14 +646,15 @@ def main():
     # === SUMMARY ===
     print(f"\n{'='*65}")
     print(f"  COMPLETE | {elapsed(t0)} | {len(selected_projects)} project(s)")
-    print(f"  9 cubes published to DEV:")
+    print(f"  10 cubes published to DEV:")
     print(f"    {cn('L0_Projects')}")
+    print(f"    {cn('L4_SchemaObjects')}    ({len(schema_data)} rows)")
     print(f"    {cn('L1_Documents')}        ({len(documents_all)} rows)")
     print(f"    {cn('L2_Datasets')}         ({len(datasets_all)} rows)")
     print(f"    {cn('L12_Mapping')}         ({len(l12_mapping)} rows)")
     print(f"    {cn('L3_ReportObjects')}    ({len(report_obj_all)} rows)")
+    print(f"    {cn('L3b_MetricFormulas')}  ({len(metric_formulas)} rows)")
     print(f"    {cn('L23_Mapping')}         ({len(l23_mapping)} rows)")
-    print(f"    {cn('L4_SchemaObjects')}    ({len(schema_data)} rows)")
     print(f"    {cn('L34_Mapping')}         ({len(l34_mapping)} rows)")
     print(f"    {harvest_name}  ({len(df)} rows)")
     if CSV_EXPORT:
