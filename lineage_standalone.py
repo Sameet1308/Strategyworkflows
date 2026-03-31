@@ -228,7 +228,7 @@ def main():
 
     # === CONNECT ===
     print("\n  Connecting to PROD...")
-    prod = Connection(PROD_URL, PROD_USERNAME, PROD_PASSWORD, login_mode=1, ssl_verify=False)
+    prod = Connection(PROD_URL, PROD_USERNAME, PROD_PASSWORD, login_mode=1, ssl_verify=False, timeout=600)
     env = Environment(connection=prod)
     print("  Connecting to DEV...")
     dev = Connection(DEV_URL, DEV_USERNAME, DEV_PASSWORD, project_name=DEV_PROJECT, login_mode=1, ssl_verify=False)
@@ -407,7 +407,7 @@ def main():
     # === L3: REPORT OBJECTS ===
     print(f"\n  [L3] Report objects... ({elapsed(t0)})")
     keep_alive_prod()
-    report_obj_all = []; metric_ids = []; metric_name_lookup = {}; pid_lookup = {}
+    report_obj_all = []; metric_ids = []; metric_name_lookup = {}; pid_lookup = {}; metric_objects = []
     for project in selected_projects:
         pid = project[0]; prod.select_project(project_id=pid)
         report_obj_all.append([pid, KEY_SF, 0, KEY_SF, KEY_SF])
@@ -426,6 +426,7 @@ def main():
                 metric_ids.append(m.id)
                 metric_name_lookup[m.id] = m.name
                 pid_lookup[m.id] = pid
+                metric_objects.append(m)
             except: pass
 
         facts = list_facts(connection=prod, project_id=pid)
@@ -439,73 +440,30 @@ def main():
     publish_cube(dev, cn("L3_ReportObjects"), report_obj_all, l3_headers, FOLDER_ID)
     export_csv(csv_n("L3_ReportObjects"), report_obj_all, l3_headers)
 
-    # === L3b: METRIC FORMULAS via Changeset + Modeling Service ===
-    print(f"\n  [L3b] Metric formulas via Changeset... ({elapsed(t0)})")
-    import requests as _req
+    # === L3b: METRIC FORMULAS via mstrio SDK ===
+    # Uses m.expression.text — relies on timeout=600 for Modeling Service warm-up.
+    # 10 consecutive failures = bail out.
+    print(f"\n  [L3b] Metric formulas via mstrio SDK... ({elapsed(t0)})")
     metric_formulas = {}
     try:
-        api_base = prod.base_url
-        pid0 = selected_projects[0][0]
-        headers_api = {"X-MSTR-AuthToken": prod.token, "X-MSTR-ProjectID": pid0, "Accept": "application/json", "Content-Type": "application/json"}
-
-        # Step 1: Create changeset
-        changeset_id = None
-        try:
-            cs_resp = _req.post(f"{api_base}/model/changesets", headers=headers_api, verify=False, timeout=30)
-            if cs_resp.status_code in (200, 201):
-                changeset_id = cs_resp.json().get("id", cs_resp.headers.get("X-MSTR-MS-Changeset", ""))
-                print(f"    Changeset created: {changeset_id[:16]}...")
-            else:
-                print(f"    [WARN] Changeset creation returned {cs_resp.status_code} — trying without changeset")
-        except Exception as e:
-            print(f"    [WARN] Changeset creation failed: {e} — trying without changeset")
-
-        # Step 2: Fetch metric formulas
         ok_count = 0; fail_count = 0; consec_fail = 0
-        for i, mid in enumerate(metric_ids):
+        for i, m in enumerate(metric_objects):
             if consec_fail >= 10:
-                print(f"    [SKIP] 10 consecutive failures — skipping remaining {len(metric_ids)-i} metrics.")
+                print(f"    [SKIP] 10 consecutive failures — skipping remaining {len(metric_objects)-i} metrics.")
                 break
-            if (i+1)%50==0:
+            if (i+1)%25==0:
                 keep_alive_prod()
-                headers_api["X-MSTR-AuthToken"] = prod.token
-                print(f"      formula {i+1}/{len(metric_ids)}... ({ok_count} ok, {fail_count} skip)")
+                print(f"      formula {i+1}/{len(metric_objects)}... ({ok_count} ok, {fail_count} skip)")
             try:
-                req_headers = {**headers_api}
-                if changeset_id:
-                    req_headers["X-MSTR-MS-Changeset"] = changeset_id
-
-                r = _req.get(f"{api_base}/model/metrics/{mid}", headers=req_headers, verify=False, timeout=15)
-                if r.status_code == 200:
-                    data = r.json()
-                    formula = ""
-                    expr = data.get("expression", {})
-                    if isinstance(expr, dict):
-                        formula = expr.get("text", "")
-                    if not formula and isinstance(expr, dict):
-                        tokens = expr.get("tokens", [])
-                        if tokens:
-                            formula = " ".join(t.get("value", "") for t in tokens if t.get("value"))
-                    if formula:
-                        metric_formulas[mid] = formula.strip()
-                        ok_count += 1; consec_fail = 0
-                    else:
-                        fail_count += 1; consec_fail += 1
+                formula = m.expression.text if m.expression else ""
+                if formula:
+                    metric_formulas[m.id] = formula.strip()
+                    ok_count += 1; consec_fail = 0
                 else:
                     fail_count += 1; consec_fail += 1
-            except _req.exceptions.Timeout:
-                fail_count += 1; consec_fail += 1
             except Exception as e:
                 fail_count += 1; consec_fail += 1
-                if fail_count <= 3: print(f"      [WARN] metric {mid}: {e}")
-
-        # Step 3: Close changeset
-        if changeset_id:
-            try:
-                _req.delete(f"{api_base}/model/changesets/{changeset_id}", headers=headers_api, verify=False, timeout=10)
-                print(f"    Changeset closed")
-            except: pass
-
+                if fail_count <= 3: print(f"      [WARN] metric {m.name}: {e}")
         print(f"    Metric formulas: {ok_count} captured, {fail_count} blank ({elapsed(t0)})")
     except Exception as e:
         print(f"    [WARN] L3b failed entirely: {e} — continuing without formulas")
