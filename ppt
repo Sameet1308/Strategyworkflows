@@ -1,0 +1,56 @@
+# Strategy AI Agents — Our Experience
+
+## Slide-ready content
+
+> **Suggested slide title:** Strategy AI Agents — Our Experience  
+> **Suggested subtitle:** What we observed, watchouts, and what helped
+
+| Area | What we observed | Watchout | What helped |
+|---|---|---|---|
+| Accuracy | Results depend heavily on semantic model quality, aliases, descriptions, and relationships. | Answers can look correct technically but still reflect the wrong business meaning. | Use governed semantic models and review interpretation / SQL where possible. |
+| Hallucinations | Hallucinations are still possible, especially when too much knowledge or context is loaded into the agent. | The agent may produce confident but unsupported explanations or summaries. | Keep knowledge assets focused, structured, and split into smaller rows. |
+| Ambiguity | Business wording can still be interpreted in different ways. | Terms like "performance," "latest," or business acronyms can map to the wrong metric, attribute, or scope. | Add aliases, synonyms, and clear business-friendly naming. |
+| Data volume / scale | We did not find one simple official hard limit for agent dataset size. Real behavior appears to depend more on model design, workload shape, and context size. | Performance and answer quality can vary depending on the dataset, question pattern, and environment. | Test with real business questions and real datasets instead of assuming a generic scale number. |
+| Large context | Too much context can increase token load, slow responses, and reduce answer quality. | Slower answers and weaker grounding. | Use smaller, relevant chunks of knowledge and avoid overloading one agent. |
+| Consistency | Similar questions may not always behave identically without controls. | Output can vary across runs. | Use caching for common validated questions and curated patterns. |
+| Model dependency | Behavior can vary depending on the underlying LLM path used by the environment. | The same use case may perform differently across environments or model choices. | Standardize the model path for each use case and regression-test before switching. |
+| Direct semantic access vs agent path | Newer MCP + Mosaic access provides a more direct path to the unified semantic layer. | A broader conversational path may add more variability than direct semantic access. | Use agents where flexibility is useful, but prefer semantic-model-driven access where trust and consistency matter more. |
+| Large exports | Agents are not ideal for bulk operational extracts. | Export and usability limits apply for larger result sets. | Use reports, grids, or governed data-access patterns for large exports. |
+
+---
+
+## Suggested presenter note
+
+We evaluated Strategy AI agents mainly from a practical usage perspective: answer quality, hallucination risk, ambiguity handling, scale behavior, consistency, and fit for governed BI use cases. Overall, agents are useful for guided analytics, but they work best when backed by strong semantic modeling, focused knowledge, and clear governance.
+
+---
+
+## Official Strategy references
+
+- [Knowledge Assets Best Practices](https://www2.microstrategy.com/producthelp/Current/MCG-Workstation/en-us/Content/auto_knowledge.htm)
+- [Manage Agent Caches](https://www2.microstrategy.com/producthelp/Current/NextGenAI/en-us/Content/Agent_ManageCache.htm)
+- [Create an Agent from a Data Model](https://www2.microstrategy.com/producthelp/Current/NextGenAI/en-us/Content/auto_agent_from_model.htm)
+- [Interact with Agents Using an MCP Server](https://www2.microstrategy.com/producthelp/Current/NextGenAI/en-us/Content/agent_mcpserverintegration.htm)
+- [Ask Questions in an Agent](https://www2.microstrategy.com/producthelp/Current/NextGenAI/en-us/Content/auto_bots_new_use_bot.htm)
+- [What’s New in Strategy One](https://www2.microstrategy.com/producthelp/current/readme/en-us/content/whats_new.htm)
+- [Strategy One Readme PDF](https://www2.microstrategy.com/producthelp/Current/manuals/en/Readme.pdf)
+
+---
+
+## Optional split for PPT
+
+If one slide feels crowded, split it into:
+
+### Slide 1
+- Accuracy
+- Hallucinations
+- Ambiguity
+- Data volume / scale
+- Large context
+
+### Slide 2
+- Consistency
+- Model dependency
+- Direct semantic access vs agent path
+- Large exports
+- References
