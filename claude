@@ -1,0 +1,328 @@
+# Claude Enterprise Working Protocol & Productivity Guide
+
+**Token-Efficient Methodology | Session Protocols | Naming Standards | Sample Prompts**
+For use across all Claude Enterprise Projects and Workspaces
+Version 1.0 | June 2026
+
+-----
+
+## Table of Contents
+
+1. [Purpose and Scope](#1-purpose-and-scope)
+1. [Project Structure Standard](#2-project-structure-standard)
+1. [Daily Session Protocol](#3-daily-session-protocol)
+1. [Session Log File Format](#4-session-log-file-format-03_session_logmd)
+1. [Token Efficiency Rules — Quick Reference](#5-token-efficiency-rules--quick-reference)
+1. [Sample Prompts Library](#6-sample-prompts-library)
+1. [Team Sharing and Access Model](#7-team-sharing-and-access-model)
+1. [Checklist — Start of Project](#8-checklist--start-of-project)
+1. [Checklist — Every Session](#9-checklist--every-session)
+
+-----
+
+## 1. Purpose and Scope
+
+This guide establishes a consistent, repeatable protocol for every team member using Claude Enterprise. The same pattern applies whether you are working on RiskMind, QueryMind, MSTR Admin, or any other subject area. Follow it on Day 1 — and it pays dividends on Day 100.
+
+### Core Objectives
+
+- Minimize token consumption without sacrificing quality
+- Maintain continuity across sessions and team members
+- Keep every Project lean, focused, and easy to hand off
+- Apply one standard naming convention across all Projects
+
+-----
+
+## 2. Project Structure Standard
+
+Every Claude Enterprise Project you create should follow this folder and file structure. It is the same pattern regardless of subject area.
+
+### 2.1 Project Naming Convention
+
+```
+Format:  [AREA]_[TOPIC]_[ENV]
+
+Examples:
+  MSTR_AdminAgent_PROD
+  RISKMIND_Underwriting_DEV
+  QUERYMIND_NL2SQL_UAT
+  DBX_UnityC_Migration_PROD
+```
+
+### 2.2 Files to Upload into Every Project Knowledge Base
+
+|File Name              |Contents                                    |Update Frequency           |
+|-----------------------|--------------------------------------------|---------------------------|
+|`00_PROJECT_CONTEXT.md`|Stack, architecture overview, key decisions |When major decisions change|
+|`01_CONVENTIONS.md`    |Coding standards, naming rules, API patterns|When standards evolve      |
+|`02_DOMAIN_GLOSSARY.md`|Business domain terms and definitions       |Monthly or as needed       |
+|`03_SESSION_LOG.md`    |Cumulative session summaries (rolling)      |After every work session   |
+|`04_OPEN_ITEMS.md`     |Open questions, blockers, next steps        |After every work session   |
+
+
+> **Key Rule:** Files 00, 01, 02 are STABLE — update rarely. Files 03 and 04 are DYNAMIC — update after every session. Claude reads all of them automatically at the start of each chat inside the Project.
+
+### 2.3 Project System Prompt Template
+
+Set this as the Project Instruction (system prompt) when creating the Project. Customize the bracketed sections.
+
+```
+You are assisting a Principal Data Engineer and AI Architect.
+Stack: [e.g. AWS Bedrock, Databricks, MicroStrategy, Python, FastAPI]
+Domain: [e.g. Commercial Insurance / Underwriting]
+
+Always assume:
+- Expert-level Python and data engineering knowledge
+- No need to explain basics or add disclaimers
+- Use requests.Session() for all MSTR REST API calls
+- Code output preferred over prose unless asked otherwise
+- Reference 03_SESSION_LOG.md for prior session context
+- Reference 04_OPEN_ITEMS.md for current open questions
+```
+
+-----
+
+## 3. Daily Session Protocol
+
+Follow this sequence every working day. It takes less than 5 minutes and saves hours of re-explaining context over time.
+
+### 3.1 Opening a New Chat Session
+
+#### Step 1 — Paste your Context Card
+
+Always start a **new chat** (never continue a stale long thread) with a compact context card. Template:
+
+```
+## Session Context
+Project   : [Project Name]
+Date      : [YYYY-MM-DD]
+Session # : [e.g. Day 7 / Session 12]
+Focus     : [One sentence — what are you doing today]
+Ref files : 03_SESSION_LOG.md, 04_OPEN_ITEMS.md
+Last done : [2-3 words from last session]
+Today goal: [2-3 words of today's goal]
+Output    : [code only | explain | draft doc | review]
+```
+
+> **Why this matters:** This card costs ~100 tokens. Re-reading a 30-turn old conversation costs 3,000–8,000 tokens. The card is always cheaper.
+
+### 3.2 During the Session
+
+- Start a new chat for each distinct subtask — do not chain unrelated questions in one thread
+- Paste only the relevant code section, not full files
+- After 2–3 iterations on the same code block, start fresh — old versions burn tokens silently
+- Say `code only` or `no explanation` when you just want output
+- Around turn 15–20 you will hit context bloat — wrap up and compress before continuing
+
+### 3.3 Closing a Session — The Summary Protocol
+
+Before ending any productive session, always run the **End-of-Session Summary Prompt**:
+
+```
+End of session. Please produce a compact handoff summary in this format:
+
+SESSION SUMMARY — [Project Name] — [YYYY-MM-DD]
+=================================================
+DECISIONS MADE:
+  - [decision 1]
+  - [decision 2]
+
+CODE / ARTIFACTS PRODUCED:
+  - [file or function name] — [one line description]
+
+OPEN QUESTIONS:
+  - [question 1]
+
+NEXT SESSION START POINT:
+  - [exactly where to pick up]
+
+Keep the entire summary under 30 lines.
+```
+
+**After you get the summary:**
+
+1. Copy it and append it to `03_SESSION_LOG.md` in your Project knowledge base
+1. Update `04_OPEN_ITEMS.md` with any new open questions
+1. Re-upload both files to the Project (replace the old versions)
+
+-----
+
+## 4. Session Log File Format (`03_SESSION_LOG.md`)
+
+This is your rolling context file. Each session appends a new block at the **TOP** (most recent first). Keep the last 10 sessions. Archive older sessions to a separate file `SESSION_LOG_ARCHIVE.md` if needed.
+
+```markdown
+# SESSION LOG — [Project Name]
+# Format: Most recent session at TOP
+# Max entries: 10 (archive older to SESSION_LOG_ARCHIVE.md)
+
+---
+SESSION: Day 7 | 2026-06-01
+FOCUS: Retry logic in Agent 3
+DONE:
+  - Implemented exponential backoff (max 3 retries, base 2s)
+  - Added CloudWatch logging on retry events
+  - Tested with mock Bedrock timeout responses
+DECISIONS:
+  - Use SNS for final failure alert (not just log)
+  - Retry only on 429 and 503 — not on 400
+OPEN:
+  - Should retry state persist across Lambda cold starts?
+NEXT: Wire SNS alert into retry_handler.py
+---
+
+SESSION: Day 6 | 2026-05-31
+FOCUS: Agent 3 architecture design
+DONE:
+  - ...
+DECISIONS:
+  - ...
+OPEN:
+  - ...
+NEXT: ...
+---
+```
+
+-----
+
+## 5. Token Efficiency Rules — Quick Reference
+
+|Situation                     |Wrong Approach                |Right Approach                   |
+|------------------------------|------------------------------|---------------------------------|
+|Starting a new day’s work     |Reopen yesterday’s chat thread|New chat + Context Card paste    |
+|Fixing code repeatedly        |Keep iterating in same thread |Start fresh after 2–3 iterations |
+|Explaining your stack         |Re-type it every session      |Put it in `00_PROJECT_CONTEXT.md`|
+|Long conversation getting slow|Keep going                    |Summarize → save → new chat      |
+|Pasting code for review       |Paste entire 300-line file    |Paste only the relevant function |
+|Need code output              |Ask normally                  |Add `code only, no explanation`  |
+|Cross-project work            |Mix topics in one chat        |Separate chat per subject area   |
+|Resuming after 5+ days away   |Start from scratch            |Read `03_SESSION_LOG.md` first   |
+
+-----
+
+## 6. Sample Prompts Library
+
+### 6.1 Session Opener
+
+```
+## Session Context
+Project: RISKMIND_Underwriting_DEV
+Date: 2026-06-01 | Session: Day 12
+Focus: Add guardrails to Agent 5 (Compliance Checker)
+Ref: See 03_SESSION_LOG.md for prior context
+Last done: Completed Agent 4 output schema
+Today goal: Build input validation layer for Agent 5
+Output: Code only
+```
+
+### 6.2 End-of-Session Summary Request
+
+```
+End of session. Summarize in the standard format:
+Decisions made, code produced, open questions, next start point.
+Max 25 lines. I will append this to my 03_SESSION_LOG.md.
+```
+
+### 6.3 Resuming After a Gap (Multiple Days Away)
+
+```
+I'm resuming work on [Project Name] after [N] days.
+I've re-read 03_SESSION_LOG.md. The last session ended at:
+[paste NEXT line from last session entry]
+Today I want to: [goal]
+Output: Code only unless I ask otherwise.
+```
+
+### 6.4 Mid-Session Context Reset (When Chat Gets Long)
+
+```
+This conversation is getting long. Before we continue:
+1. Summarize what we have built/decided so far in 10 lines
+2. List the one thing we are currently solving
+I will start a fresh chat with that summary.
+```
+
+### 6.5 Surgical Code Fix (Minimal Token Spend)
+
+```
+Fix only this function. No explanation. No refactoring of surrounding code.
+Problem: [one sentence]
+
+[paste the single function here]
+```
+
+### 6.6 Team Member Onboarding to a Project
+
+```
+You are joining project [Name] mid-stream.
+Read 00_PROJECT_CONTEXT.md and 03_SESSION_LOG.md (already in this Project).
+Your task today: [task]
+Ask me only if something is missing from those files.
+```
+
+-----
+
+## 7. Team Sharing and Access Model
+
+|Role                   |Permission Level|Can Do                                          |
+|-----------------------|----------------|------------------------------------------------|
+|Project Owner / Lead   |Can Edit        |Upload docs, change instructions, manage members|
+|Team Member (Developer)|Can Use         |Chat inside project, read all docs, cannot edit |
+|Reviewer / Stakeholder |Can Use         |Read-only view, can chat but not modify         |
+
+
+> **Governance Rule:** Only the Project Owner updates `03_SESSION_LOG.md` and `04_OPEN_ITEMS.md`. Team members send their session summaries to the owner to consolidate. This prevents file conflicts and keeps the knowledge base clean.
+
+**How to share a Project:**
+
+1. Open the Project in Claude.ai
+1. Click **Share project** button next to the project name
+1. Add members by name or email, or paste a list for bulk invite
+1. Assign **Can use** or **Can edit** per person
+1. Alternatively set visibility to **Public** so everyone in the org can find it
+
+> Note: Even on a Public project, each person’s individual chat conversations remain private. Only the knowledge base (uploaded files) and instructions are shared.
+
+-----
+
+## 8. Checklist — Start of Project
+
+- [ ] Create Project with naming convention `[AREA]_[TOPIC]_[ENV]`
+- [ ] Set Project visibility: Private (invite-only) or Public (org-wide)
+- [ ] Write and save the Project System Prompt
+- [ ] Upload `00_PROJECT_CONTEXT.md`
+- [ ] Upload `01_CONVENTIONS.md`
+- [ ] Upload `02_DOMAIN_GLOSSARY.md`
+- [ ] Create empty `03_SESSION_LOG.md` and upload it
+- [ ] Create empty `04_OPEN_ITEMS.md` and upload it
+- [ ] Invite team members with correct permission levels
+- [ ] Share this protocol doc with all team members
+
+-----
+
+## 9. Checklist — Every Session
+
+- [ ] Open a **NEW chat** (do not reopen old threads)
+- [ ] Paste your Context Card at the top
+- [ ] Work — paste only what is relevant to the current task
+- [ ] At end: run End-of-Session Summary Prompt
+- [ ] Append summary to `03_SESSION_LOG.md`
+- [ ] Update `04_OPEN_ITEMS.md` with any new open questions or resolved items
+- [ ] Re-upload both files to Project knowledge base (replace old versions)
+
+-----
+
+## How Claude Reads Your Project Files
+
+When you chat inside a Project, Claude automatically reads all uploaded knowledge base files at the start of every conversation. This means:
+
+- You never need to paste `00_PROJECT_CONTEXT.md` — Claude already has it
+- You never need to re-explain your stack, conventions, or domain
+- The only thing you paste is your **Context Card** (the dynamic, session-specific part)
+- The `03_SESSION_LOG.md` gives Claude memory of what happened in past sessions without you re-reading old chats
+
+This is the entire point of the Project knowledge base — **stable context lives in files, dynamic context lives in the Context Card.**
+
+-----
+
+*Claude Enterprise Working Protocol v1.0 | Internal Use Only*
